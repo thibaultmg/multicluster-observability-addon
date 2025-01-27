@@ -35,6 +35,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to start hub test environment: %v", err))
 	}
+	fmt.Println(restCfgHub.Host, restCfgHub.String())
 
 	code := m.Run()
 

@@ -11,7 +11,6 @@ import (
 	prometheusalpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 	"github.com/rhobs/multicluster-observability-addon/internal/addon"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -19,6 +18,8 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	addonapiv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
+	clusterapiv1beta1 "open-cluster-management.io/api/cluster/v1beta1"
+	clusterapiv1beta2 "open-cluster-management.io/api/cluster/v1beta2"
 	workv1 "open-cluster-management.io/api/work/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,6 +37,8 @@ func newScheme() *runtime.Scheme {
 	utilruntime.Must(addonapiv1alpha1.Install(scheme))
 	utilruntime.Must(prometheusalpha1.AddToScheme(scheme))
 	utilruntime.Must(prometheusv1.AddToScheme(scheme))
+	utilruntime.Must(clusterapiv1beta1.AddToScheme(scheme))
+	utilruntime.Must(clusterapiv1beta2.AddToScheme(scheme))
 
 	return scheme
 }
@@ -87,18 +90,18 @@ func newManagedCluster(name string) *clusterv1.ManagedCluster {
 	}
 }
 
-func newClusterManagementAddon() *addonapiv1alpha1.ClusterManagementAddOn {
-	return &addonapiv1alpha1.ClusterManagementAddOn{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: addon.Name,
-		},
-		Spec: addonapiv1alpha1.ClusterManagementAddOnSpec{
-			InstallStrategy: addonapiv1alpha1.InstallStrategy{
-				Type: addonapiv1alpha1.AddonInstallStrategyPlacements,
-			},
-		},
-	}
-}
+// func newClusterManagementAddon() *addonapiv1alpha1.ClusterManagementAddOn {
+// 	return &addonapiv1alpha1.ClusterManagementAddOn{
+// 		ObjectMeta: metav1.ObjectMeta{
+// 			Name: addon.Name,
+// 		},
+// 		Spec: addonapiv1alpha1.ClusterManagementAddOnSpec{
+// 			InstallStrategy: addonapiv1alpha1.InstallStrategy{
+// 				Type: addonapiv1alpha1.AddonInstallStrategyPlacements,
+// 			},
+// 		},
+// 	}
+// }
 
 type addonDeploymentConfigBuilder addonapiv1alpha1.AddOnDeploymentConfig
 
