@@ -13,7 +13,7 @@
       resources: ["subjectaccessreviews"]
       verbs: ["get", "create"]
     - apiGroups: ["cluster.open-cluster-management.io"]
-      resources: ["managedclusters", "placements", "placementdecisions"]
+      resources: ["managedclusters", "placementdecisions"]
       verbs: ["get", "list", "watch"]
     - apiGroups: ["addon.open-cluster-management.io"]
       resources: ["managedclusteraddons/finalizers"]
@@ -26,7 +26,7 @@
       verbs: ["update", "patch"]
     - apiGroups: ["addon.open-cluster-management.io"]
       resources: ["clustermanagementaddons"]
-      verbs: ["get", "list", "watch"]
+      verbs: ["get", "list", "watch", "patch"]
     - apiGroups: ["addon.open-cluster-management.io"]
       resources: ["managedclusteraddons"]
       verbs: ["get", "list", "watch", "create", "update", "delete"]
@@ -34,8 +34,11 @@
       resources: ["managedclusteraddons/status"]
       verbs: ["update", "patch"]
     - apiGroups: ["addon.open-cluster-management.io"]
-      resources: ["addontemplates", "addondeploymentconfigs"]
+      resources: ["addontemplates"]
       verbs: ["get", "list", "watch"]
+    - apiGroups: ["addon.open-cluster-management.io"]
+      resources: ["addondeploymentconfigs"]
+      verbs: ["get", "list", "watch", "update"]
     - apiGroups: ["work.open-cluster-management.io"]
       resources: ["manifestworks"]
       verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
@@ -52,9 +55,14 @@
     - apiGroups: ["rbac.authorization.k8s.io"]
       resources: ["rolebindings"]
       verbs: ["get", "list", "watch", "create", "delete"]
-    # The addon will need to create secrets to ensure secure communication
+    # The addon will need to pull secrets to configure the signals deployments
     - apiGroups: [""]
       resources: ["secrets"]
+      verbs: ["get", "list", "watch"]
+    # The addon will need to pull subscriptions to know if certain operators
+    # are installed in the hub cluster
+    - apiGroups: ["operators.coreos.com"]
+      resources: ["subscriptions"]
       verbs: ["get", "list", "watch"]
     # Roles for addon to perform logging specific actions
     - apiGroups: ["observability.openshift.io"]
@@ -64,3 +72,15 @@
     - apiGroups: ["opentelemetry.io"]
       resources: ["opentelemetrycollectors", "instrumentations"]
       verbs: ["get", "list", "watch"]
+    # Role for addon to perform metrics specific actions
+    - apiGroups: ["monitoring.coreos.com"]
+      resources: ["prometheusrules", "servicemonitors"]
+      verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+    - apiGroups: ["monitoring.rhobs"]
+      resources: ["prometheusagents", "scrapeconfigs", "prometheusrules"]
+      verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+    - apiGroups: ["hypershift.openshift.io"]
+      resources: ["hostedclusters"]
+      verbs: ["get", "list", "watch"]
+
+

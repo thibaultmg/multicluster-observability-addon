@@ -3,178 +3,1047 @@ package metrics_test
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	configv1 "github.com/openshift/api/config/v1"
+	operatorv1 "github.com/openshift/api/operator/v1"
+	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	prometheusv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	prometheusalpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
-	"github.com/rhobs/multicluster-observability-addon/internal/addon"
-	"github.com/rhobs/multicluster-observability-addon/internal/metrics/config"
-	"github.com/rhobs/multicluster-observability-addon/internal/metrics/handlers"
-	"github.com/rhobs/multicluster-observability-addon/internal/metrics/manifests"
-	"github.com/rhobs/multicluster-observability-addon/internal/metrics/resource"
+	cooprometheusv1 "github.com/rhobs/obo-prometheus-operator/pkg/apis/monitoring/v1"
+	cooprometheusv1alpha1 "github.com/rhobs/obo-prometheus-operator/pkg/apis/monitoring/v1alpha1"
+	clusterinfov1beta1 "github.com/stolostron/cluster-lifecycle-api/clusterinfo/v1beta1"
+	clusterlifecycleconstants "github.com/stolostron/cluster-lifecycle-api/constants"
+	"github.com/stolostron/multicluster-observability-addon/internal/addon"
+	"github.com/stolostron/multicluster-observability-addon/internal/addon/common"
+	addoncfg "github.com/stolostron/multicluster-observability-addon/internal/addon/config"
+	"github.com/stolostron/multicluster-observability-addon/internal/metrics/config"
+	"github.com/stolostron/multicluster-observability-addon/internal/metrics/handlers"
+	"github.com/stolostron/multicluster-observability-addon/internal/metrics/manifests"
+	internalres "github.com/stolostron/multicluster-observability-addon/internal/metrics/resource"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	meta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	"open-cluster-management.io/addon-framework/pkg/addonfactory"
 	"open-cluster-management.io/addon-framework/pkg/addonmanager/addontesting"
 	"open-cluster-management.io/addon-framework/pkg/agent"
-	addonapiv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
-	fakeaddon "open-cluster-management.io/api/client/addon/clientset/versioned/fake"
+	"open-cluster-management.io/addon-framework/pkg/utils"
+	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
+	workv1 "open-cluster-management.io/api/work/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
+const (
+	testClusterID = "97e51387-3da1-4ae4-89e3-f29bcd42fd42"
+)
+
+type mockAODCGetter struct {
+	aodc *addonapiv1beta1.AddOnDeploymentConfig
+}
+
+func (m mockAODCGetter) Get(ctx context.Context, namespace, name string) (*addonapiv1beta1.AddOnDeploymentConfig, error) {
+	return m.aodc, nil
+}
+
 func TestHelmBuild_Metrics_All(t *testing.T) {
+	hubNamespace := "open-cluster-management-observability"
+
+	verifyClusterScopedResourcesPrefix := func(t *testing.T, objects []client.Object) {
+		// Ensure all ClusterRoles and ClusterRoleBindings have the 'acm-' prefix to prevent controller fights.
+		clusterRoles := common.FilterResourcesByLabelSelector[*rbacv1.ClusterRole](objects, nil)
+		for _, cr := range clusterRoles {
+			assert.True(t, strings.HasPrefix(cr.Name, "acm-"), "ClusterRole %s is missing the 'acm-' prefix", cr.Name)
+		}
+
+		clusterRoleBindings := common.FilterResourcesByLabelSelector[*rbacv1.ClusterRoleBinding](objects, nil)
+		for _, crb := range clusterRoleBindings {
+			assert.True(t, strings.HasPrefix(crb.Name, "acm-"), "ClusterRoleBinding %s is missing the 'acm-' prefix", crb.Name)
+			// Skip OpenShift built-in roles that we do not manage/prefix
+			if crb.RoleRef.Kind == "ClusterRole" && crb.RoleRef.Name != "cluster-monitoring-view" {
+				assert.True(t, strings.HasPrefix(crb.RoleRef.Name, "acm-"), "ClusterRoleBinding %s refers to a ClusterRole %s missing the 'acm-' prefix", crb.Name, crb.RoleRef.Name)
+			}
+		}
+	}
+
 	testCases := map[string]struct {
-		PlatformMetrics bool
-		UserMetrics     bool
-		Expects         func(*testing.T, []client.Object)
+		PlatformMetrics  bool
+		UserMetrics      bool
+		COOIsInstalled   bool
+		IsOCP            bool
+		IsHub            bool
+		InstallNamespace string
+		ResourceReqs     bool
+		Registries       []addonapiv1beta1.ImageMirror
+		NodeExporterOpts addon.NodeExporterOptions
+		Expects          func(*testing.T, []client.Object)
 	}{
 		"no metrics": {
 			PlatformMetrics: false,
 			UserMetrics:     false,
+			IsOCP:           true,
 			Expects: func(t *testing.T, objects []client.Object) {
-				assert.Len(t, objects, 0)
+				assert.Empty(t, objects)
 			},
 		},
-		"platform metrics": {
+		"platform metrics, no coo": {
 			PlatformMetrics: true,
 			UserMetrics:     false,
+			COOIsInstalled:  false,
+			IsOCP:           true,
 			Expects: func(t *testing.T, objects []client.Object) {
 				// ensure the agent is created
-				agent := addon.FilterResourcesByLabelSelector[*prometheusalpha1.PrometheusAgent](objects, config.PlatformPrometheusMatchLabels)
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.PlatformPrometheusMatchLabels)
 				assert.Len(t, agent, 1)
 				assert.Equal(t, config.PlatformMetricsCollectorApp, agent[0].GetName())
 				assert.NotEmpty(t, agent[0].Spec.CommonPrometheusFields.RemoteWrite[0].URL)
-				// ensure that the haproxy config is created
-				haProxyConfig := addon.FilterResourcesByLabelSelector[*corev1.ConfigMap](objects, config.PlatformPrometheusMatchLabels)
-				assert.Len(t, haProxyConfig, 1)
+				assert.Contains(t, agent[0].Spec.ConfigMaps, "my-configmap")
 				// ensure that scrape config is created and matches the agent
-				scrapeCfgs := addon.FilterResourcesByLabelSelector[*prometheusalpha1.ScrapeConfig](objects, config.PlatformPrometheusMatchLabels)
+				scrapeCfgs := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.ScrapeConfig](objects, config.PlatformPrometheusMatchLabels)
 				assert.Len(t, scrapeCfgs, 2)
 				assert.Equal(t, config.PrometheusControllerID, scrapeCfgs[0].Annotations["operator.prometheus.io/controller-id"])
+				assert.NotEmpty(t, agent[0].Spec.ScrapeConfigSelector.MatchLabels)
+				scrapeConfigsSelector := labels.SelectorFromSet(labels.Set(agent[0].Spec.ScrapeConfigSelector.MatchLabels))
+				assert.True(t, scrapeConfigsSelector.Matches(labels.Set(scrapeCfgs[0].Labels)))
 				// ensure that recording rules are created
-				recordingRules := addon.FilterResourcesByLabelSelector[*prometheusv1.PrometheusRule](objects, config.PlatformPrometheusMatchLabels)
+				recordingRules := common.FilterResourcesByLabelSelector[*prometheusv1.PrometheusRule](objects, config.PlatformPrometheusMatchLabels)
 				assert.Len(t, recordingRules, 2)
 				assert.Equal(t, "openshift-monitoring/prometheus-operator", recordingRules[0].Annotations["operator.prometheus.io/controller-id"])
+				// Ensure the COO Prometheus operator is generated
+				cooOperator := common.FilterResourcesByLabelSelector[*appsv1.Deployment](objects, nil)
+				assert.Len(t, cooOperator, 1)
 				// ensure that the number of objects is correct
-				// 4 (prom operator) + 6 (agent + haproxy config) + 2 secrets (mTLS to hub) + 1 cm (prom ca) + 2 rule + 2 scrape config = 16
-				assert.Len(t, objects, 17)
-				assert.Len(t, addon.FilterResourcesByLabelSelector[*corev1.Secret](objects, nil), 2) // 2 secrets (mTLS to hub)
+				// 4 (prom operator) + 5 (agent) + 2 secrets (mTLS to hub) + 1 cm (prom ca) + 2 rule + 2 scrape config + 1 configmap + 1 namespace = 17
+				expectedCount := 36
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
+
+				// ensure the namespace has the correct labels
+				ns := common.FilterResourcesByLabelSelector[*corev1.Namespace](objects, nil)
+				require.Len(t, ns, 1)
+				assert.Equal(t, addonfactory.AddonDefaultInstallNamespace, ns[0].Name)
+				assert.Equal(t, "true", ns[0].Labels["openshift.io/cluster-monitoring"])
+				assert.Empty(t, ns[0].Labels["app"])
+
+				secrets := common.FilterResourcesByLabelSelector[*corev1.Secret](objects, nil)
+				assert.Len(t, secrets, 4) // 4 secrets (mTLS to hub) + alertmananger secrets (accessor+ca in platform)
+
+				// Ensure that the original resource annotation is set
+				for _, obj := range secrets {
+					origin := obj.Annotations[addoncfg.AnnotationOriginalResource]
+					assert.NotEmpty(t, origin, "original resource annotation should not be empty", "name", obj.Name, "annotation", origin)
+				}
+				configmaps := common.FilterResourcesByLabelSelector[*corev1.ConfigMap](objects, nil)
+				assert.Greater(t, len(configmaps), 1)
+
+				// Ensure that the original resource annotation is set
+				for _, obj := range configmaps {
+					if obj.Name == config.PrometheusCAConfigMapName {
+						// ignore this configmap directly defined in helm charts
+						continue
+					}
+					origin := obj.Annotations[addoncfg.AnnotationOriginalResource]
+					assert.NotEmpty(t, origin, "original resource annotation should not be empty", "name", obj.Name, "annotation", origin)
+				}
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"platform metrics, no coo, is hub": {
+			PlatformMetrics: true,
+			UserMetrics:     false,
+			COOIsInstalled:  false,
+			IsOCP:           true,
+			IsHub:           true,
+			Expects: func(t *testing.T, objects []client.Object) {
+				crds := common.FilterResourcesByLabelSelector[*apiextensionsv1.CustomResourceDefinition](objects, nil)
+				expectedCount := 4 // Some CRDs are not installed by MCOA on the hub but by MCO
+				if len(crds) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d", expectedCount, len(crds))
+				}
+				// ensure that the number of objects is correct
+				expectedCount = 34
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"platform metrics, coo is installed": {
+			PlatformMetrics: true,
+			UserMetrics:     false,
+			COOIsInstalled:  true,
+			IsOCP:           true,
+			Expects: func(t *testing.T, objects []client.Object) {
+				// ensure the agent is created and gets the label expected by the OLM installed COO operator
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.PlatformPrometheusMatchLabels)
+				assert.Len(t, agent, 1)
+				assert.Equal(t, "observability-operator", agent[0].Labels["app.kubernetes.io/managed-by"])
+				assert.Empty(t, agent[0].Annotations["operator.prometheus.io/controller-id"])
+				// ensure that the number of objects is correct
+				expectedCount := 23
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
+				verifyClusterScopedResourcesPrefix(t, objects)
 			},
 		},
 		"user workload metrics": {
 			PlatformMetrics: false,
 			UserMetrics:     true,
+			IsOCP:           true,
 			Expects: func(t *testing.T, objects []client.Object) {
 				// ensure the agent is created
-				agent := addon.FilterResourcesByLabelSelector[*prometheusalpha1.PrometheusAgent](objects, config.UserWorkloadPrometheusMatchLabels)
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.UserWorkloadPrometheusMatchLabels)
 				assert.Len(t, agent, 1)
 				assert.Equal(t, config.UserWorkloadMetricsCollectorApp, agent[0].GetName())
 				assert.NotEmpty(t, agent[0].Spec.CommonPrometheusFields.RemoteWrite[0].URL)
-				// ensure that the haproxy config is created
-				haProxyConfig := addon.FilterResourcesByLabelSelector[*corev1.ConfigMap](objects, config.UserWorkloadPrometheusMatchLabels)
-				assert.Len(t, haProxyConfig, 1)
 				// ensure that scrape config is created and matches the agent
-				scrapeCfgs := addon.FilterResourcesByLabelSelector[*prometheusalpha1.ScrapeConfig](objects, config.UserWorkloadPrometheusMatchLabels)
+				scrapeCfgs := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.ScrapeConfig](objects, config.UserWorkloadPrometheusMatchLabels)
 				assert.Len(t, scrapeCfgs, 2)
 				assert.Equal(t, config.PrometheusControllerID, scrapeCfgs[0].Annotations["operator.prometheus.io/controller-id"])
+				assert.NotEmpty(t, agent[0].Spec.ScrapeConfigSelector.MatchLabels)
+				scrapeConfigsSelector := labels.SelectorFromSet(labels.Set(agent[0].Spec.ScrapeConfigSelector.MatchLabels))
+				assert.True(t, scrapeConfigsSelector.Matches(labels.Set(scrapeCfgs[0].Labels)))
 				// ensure that recording rules are created
-				recordingRules := addon.FilterResourcesByLabelSelector[*prometheusv1.PrometheusRule](objects, config.UserWorkloadPrometheusMatchLabels)
+				recordingRules := common.FilterResourcesByLabelSelector[*prometheusv1.PrometheusRule](objects, config.UserWorkloadPrometheusMatchLabels)
 				assert.Len(t, recordingRules, 2)
 				assert.Equal(t, "openshift-user-workload-monitoring/prometheus-operator", recordingRules[0].Annotations["operator.prometheus.io/controller-id"])
+				// ensure that COO recording rules are created
+				cooRecordingRules := common.FilterResourcesByLabelSelector[*cooprometheusv1.PrometheusRule](objects, config.UserWorkloadPrometheusMatchLabels)
+				assert.Len(t, cooRecordingRules, 2)
+				assert.Equal(t, "openshift-user-workload-monitoring/prometheus-operator", cooRecordingRules[0].Annotations["operator.prometheus.io/controller-id"])
+				expectedCount := 38
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
 
-				assert.Len(t, objects, 17)
-				assert.Len(t, addon.FilterResourcesByLabelSelector[*corev1.Secret](objects, nil), 2) // 2 secrets (mTLS to hub)
+				assert.Len(t, common.FilterResourcesByLabelSelector[*corev1.Secret](objects, nil), 4) // 2 secrets (mTLS to hub) + alertmananger secrets (accessor+ca in uwl)
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"user workload, coo is installed": {
+			PlatformMetrics: false,
+			UserMetrics:     true,
+			COOIsInstalled:  true,
+			IsOCP:           true,
+			Expects: func(t *testing.T, objects []client.Object) {
+				// ensure the agent is created and gets the label expected by the OLM installed COO operator
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.UserWorkloadPrometheusMatchLabels)
+				assert.Len(t, agent, 1)
+				assert.Equal(t, "observability-operator", agent[0].Labels["app.kubernetes.io/managed-by"])
+				assert.Empty(t, agent[0].Annotations["operator.prometheus.io/controller-id"])
+
+				crds := common.FilterResourcesByLabelSelector[*apiextensionsv1.CustomResourceDefinition](objects, nil)
+				assert.Len(t, crds, 1) // Only the monitoringstacks one
+
+				// ensure that the number of objects is correct
+				expectedCount := 25
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"is non ocp": {
+			PlatformMetrics: true,
+			UserMetrics:     false,
+			COOIsInstalled:  false,
+			IsOCP:           false,
+			Expects: func(t *testing.T, objects []client.Object) {
+				// ensure the agent is created
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.PlatformPrometheusMatchLabels)
+				assert.Len(t, agent, 1)
+				assert.Equal(t, config.PlatformMetricsCollectorApp, agent[0].GetName())
+				assert.NotEmpty(t, agent[0].Spec.CommonPrometheusFields.RemoteWrite[0].URL)
+
+				matchLabels := map[string]string{
+					"app.kubernetes.io/name": "prometheus-operator",
+				}
+
+				// Ensure the ServiceMonitor is configured for HTTP
+				sms := common.FilterResourcesByLabelSelector[*prometheusv1.ServiceMonitor](objects, matchLabels)
+				assert.Len(t, sms, 1)
+				operatorSM := sms[0]
+				assert.NotNil(t, operatorSM.Spec.Endpoints[0].Scheme)
+				assert.Equal(t, prometheusv1.Scheme("http"), *operatorSM.Spec.Endpoints[0].Scheme)
+				assert.Nil(t, operatorSM.Spec.Endpoints[0].TLSConfig)
+
+				// Ensure the Service is targeting the correct port
+				svcs := common.FilterResourcesByLabelSelector[*corev1.Service](objects, matchLabels)
+				assert.Len(t, svcs, 1)
+				operatorSvc := svcs[0]
+				metricsPort := findServicePortByName(operatorSvc.Spec.Ports, "metrics")
+				require.NotNil(t, metricsPort, "metrics port not found in operator service")
+				assert.Equal(t, "metrics", metricsPort.TargetPort.StrVal)
+				assert.Equal(t, int32(8080), metricsPort.Port)
+
+				// Ensure the Deployment has the correct ports and no sidecar
+				deps := common.FilterResourcesByLabelSelector[*appsv1.Deployment](objects, matchLabels)
+				assert.Len(t, deps, 1)
+				operatorDep := deps[0]
+
+				// Check for metrics port on the main container
+				metricsPortFound := false
+				for _, port := range operatorDep.Spec.Template.Spec.Containers[0].Ports {
+					if port.ContainerPort == 8080 && port.Name == "metrics" {
+						metricsPortFound = true
+						break
+					}
+				}
+				assert.True(t, metricsPortFound, "Metrics port 8080 not found on operator container")
+				// Check that kube-rbac-proxy sidecar is NOT present
+				sidecarFound := false
+				for _, c := range operatorDep.Spec.Template.Spec.Containers {
+					if c.Name == "kube-rbac-proxy" {
+						sidecarFound = true
+						break
+					}
+				}
+				assert.False(t, sidecarFound, "kube-rbac-proxy sidecar should not be present")
+
+				// Check that prometheus-operator has kubelet-endpointslice args
+				var operatorContainer *corev1.Container
+				for i := range operatorDep.Spec.Template.Spec.Containers {
+					if operatorDep.Spec.Template.Spec.Containers[i].Name == "prometheus-operator" {
+						operatorContainer = &operatorDep.Spec.Template.Spec.Containers[i]
+						break
+					}
+				}
+				require.NotNil(t, operatorContainer, "prometheus-operator container not found")
+				assert.Contains(t, operatorContainer.Args, "--kubelet-endpointslice=true", "prometheus-operator should have --kubelet-endpointslice=true")
+
+				// Ensure kube-state-metrics deployment has the resources flag
+				ksmMatchLabels := map[string]string{
+					"app.kubernetes.io/name": "kube-state-metrics",
+				}
+				ksmDeps := common.FilterResourcesByLabelSelector[*appsv1.Deployment](objects, ksmMatchLabels)
+				require.Len(t, ksmDeps, 1)
+				resourcesFlagFound := false
+				var ksmContainer *corev1.Container
+				for i := range ksmDeps[0].Spec.Template.Spec.Containers {
+					if ksmDeps[0].Spec.Template.Spec.Containers[i].Name == "kube-state-metrics" {
+						ksmContainer = &ksmDeps[0].Spec.Template.Spec.Containers[i]
+						break
+					}
+				}
+				require.NotNil(t, ksmContainer, "kube-state-metrics container not found")
+				for _, arg := range ksmContainer.Args {
+					if strings.HasPrefix(arg, "--resources=") {
+						resourcesFlagFound = true
+						// Assert the exact string of collected resources
+						assert.Equal(t, "--resources=certificatesigningrequests,configmaps,cronjobs,daemonsets,deployments,endpointslices,horizontalpodautoscalers,ingresses,jobs,leases,limitranges,mutatingwebhookconfigurations,namespaces,networkpolicies,nodes,persistentvolumeclaims,persistentvolumes,poddisruptionbudgets,pods,replicasets,replicationcontrollers,resourcequotas,services,statefulsets,storageclasses,validatingwebhookconfigurations,volumeattachments", arg)
+						break
+					}
+				}
+				assert.True(t, resourcesFlagFound, "kube-state-metrics should have --resources flag configured")
+
+				// Ensure the Prometheus resource has the correct secrets
+				proms := common.FilterResourcesByLabelSelector[*cooprometheusv1.Prometheus](objects, nil)
+				assert.Len(t, proms, 1)
+				trimmedID := config.GetTrimmedClusterID(testClusterID)
+				assert.Contains(t, proms[0].Spec.Secrets, config.GetAlertmanagerRouterCASecretName(trimmedID))
+				assert.Contains(t, proms[0].Spec.Secrets, config.GetAlertmanagerAccessorSecretName(trimmedID))
+
+				verifyClusterScopedResourcesPrefix(t, objects)
+
+				// ensure that the number of objects is correct
+				expectedCount := 72
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
+			},
+		},
+		"node exporter custom ports": {
+			PlatformMetrics: true,
+			UserMetrics:     false,
+			COOIsInstalled:  false,
+			IsOCP:           false,
+			NodeExporterOpts: addon.NodeExporterOptions{
+				HostPort:     29100,
+				InternalPort: 29101,
+			},
+			Expects: func(t *testing.T, objects []client.Object) {
+				matchLabels := map[string]string{
+					"app.kubernetes.io/name": "node-exporter",
+				}
+				dss := common.FilterResourcesByLabelSelector[*appsv1.DaemonSet](objects, matchLabels)
+				assert.Len(t, dss, 1)
+				ds := dss[0]
+
+				// Check ports in the container args
+				var nodeExporterContainer *corev1.Container
+				for i := range ds.Spec.Template.Spec.Containers {
+					if ds.Spec.Template.Spec.Containers[i].Name == "node-exporter" {
+						nodeExporterContainer = &ds.Spec.Template.Spec.Containers[i]
+						break
+					}
+				}
+				require.NotNil(t, nodeExporterContainer, "node-exporter container not found")
+				assert.Contains(t, nodeExporterContainer.Args, "--web.listen-address=127.0.0.1:29101")
+
+				var rbacProxyContainer *corev1.Container
+				for i := range ds.Spec.Template.Spec.Containers {
+					if ds.Spec.Template.Spec.Containers[i].Name == "kube-rbac-proxy" {
+						rbacProxyContainer = &ds.Spec.Template.Spec.Containers[i]
+						break
+					}
+				}
+				require.NotNil(t, rbacProxyContainer, "kube-rbac-proxy container not found")
+				assert.Contains(t, rbacProxyContainer.Args, "--secure-listen-address=$(IP):29100")
+				assert.Contains(t, rbacProxyContainer.Args, "--upstream=http://127.0.0.1:29101/")
+
+				// Check container ports
+				rbacProxyPort := findContainerPortByName(rbacProxyContainer.Ports, "https")
+				require.NotNil(t, rbacProxyPort, "https port not found in kube-rbac-proxy container")
+				assert.Equal(t, int32(29100), rbacProxyPort.ContainerPort)
+
+				// Check Service port
+				svcs := common.FilterResourcesByLabelSelector[*corev1.Service](objects, matchLabels)
+				require.Len(t, svcs, 1)
+				nodeExporterPort := findServicePortByName(svcs[0].Spec.Ports, "https")
+				require.NotNil(t, nodeExporterPort, "https port not found in node-exporter service")
+				assert.Equal(t, int32(29100), nodeExporterPort.Port)
+				assert.Equal(t, "https", nodeExporterPort.TargetPort.StrVal)
+
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"custom namespace": {
+			PlatformMetrics:  true,
+			UserMetrics:      false,
+			COOIsInstalled:   false,
+			IsOCP:            false,
+			InstallNamespace: "custom",
+			Expects: func(t *testing.T, objects []client.Object) {
+				// ensure the namespace is created
+				ns := common.FilterResourcesByLabelSelector[*corev1.Namespace](objects, nil)
+				require.Len(t, ns, 1)
+				assert.Equal(t, "custom", ns[0].Name)
+				assert.Equal(t, "true", ns[0].Labels["openshift.io/cluster-monitoring"])
+				// For custom namespaces, chart labels SHOULD be present
+				assert.Equal(t, "metrics", ns[0].Labels["app"])
+
+				// ensure that the number of objects is correct
+				expectedCount := 72
+				if len(objects) != expectedCount {
+					t.Fatalf("expected %d objects, but got %d:\n%s", expectedCount, len(objects), formatObjects(objects))
+				}
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"resource requests and limits": {
+			PlatformMetrics: true,
+			UserMetrics:     false,
+			COOIsInstalled:  false,
+			IsOCP:           true,
+			ResourceReqs:    true,
+			Expects: func(t *testing.T, objects []client.Object) {
+				// Verify prometheus agent has the correct resource requirements
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.PlatformPrometheusMatchLabels)
+				assert.Len(t, agent, 1)
+
+				expectedPrometheusResources := corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("200m"),
+						corev1.ResourceMemory: resource.MustParse("256Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("100m"),
+						corev1.ResourceMemory: resource.MustParse("128Mi"),
+					},
+				}
+				assert.Equal(t, expectedPrometheusResources, agent[0].Spec.Resources)
+
+				// Verify prometheus-operator deployment has the correct resource requirements
+				operatorMatchLabels := map[string]string{
+					"app.kubernetes.io/name": "prometheus-operator",
+				}
+				deployments := common.FilterResourcesByLabelSelector[*appsv1.Deployment](objects, operatorMatchLabels)
+				assert.Len(t, deployments, 1, "Should find exactly one prometheus-operator deployment")
+
+				expectedOperatorResources := corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("150m"),
+						corev1.ResourceMemory: resource.MustParse("192Mi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("75m"),
+						corev1.ResourceMemory: resource.MustParse("96Mi"),
+					},
+				}
+				// Find the prometheus-operator container in the deployment
+				var operatorContainer *corev1.Container
+				for i := range deployments[0].Spec.Template.Spec.Containers {
+					if deployments[0].Spec.Template.Spec.Containers[i].Name == "prometheus-operator" {
+						operatorContainer = &deployments[0].Spec.Template.Spec.Containers[i]
+						break
+					}
+				}
+				assert.NotNil(t, operatorContainer, "prometheus-operator container not found")
+				assert.Equal(t, expectedOperatorResources, operatorContainer.Resources)
+				verifyClusterScopedResourcesPrefix(t, objects)
+			},
+		},
+		"image registry overrides": {
+			PlatformMetrics: true,
+			UserMetrics:     false,
+			COOIsInstalled:  false,
+			IsOCP:           true,
+			Registries: []addonapiv1beta1.ImageMirror{
+				{
+					Source: "quay.io/prometheus/obo-operator",
+					Mirror: "my-registry.com/prometheus/obo-operator",
+				},
+				{
+					Source: "quay.io/kube/rbac-proxy",
+					Mirror: "my-registry.com/kube/rbac-proxy",
+				},
+			},
+			Expects: func(t *testing.T, objects []client.Object) {
+				// Check Prometheus Agent image
+				agent := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.PrometheusAgent](objects, config.PlatformPrometheusMatchLabels)
+				assert.Len(t, agent, 1)
+				assert.Equal(t, "my-registry.com/kube/rbac-proxy", agent[0].Spec.Containers[0].Image)
+
+				// Check COO Operator image
+				cooOperator := common.FilterResourcesByLabelSelector[*appsv1.Deployment](objects, nil)
+				assert.Len(t, cooOperator, 1)
+				assert.Equal(t, "my-registry.com/prometheus/obo-operator", cooOperator[0].Spec.Template.Spec.Containers[0].Image)
+				verifyClusterScopedResourcesPrefix(t, objects)
 			},
 		},
 	}
 
 	scheme := runtime.NewScheme()
 	assert.NoError(t, kubescheme.AddToScheme(scheme))
-	assert.NoError(t, prometheusalpha1.AddToScheme(scheme))
+	assert.NoError(t, cooprometheusv1alpha1.AddToScheme(scheme))
 	assert.NoError(t, prometheusv1.AddToScheme(scheme))
-	assert.NoError(t, clusterv1.AddToScheme(scheme))
+	assert.NoError(t, cooprometheusv1.AddToScheme(scheme))
+	assert.NoError(t, clusterv1.Install(scheme))
+	assert.NoError(t, addonapiv1beta1.Install(scheme))
+	assert.NoError(t, workv1.Install(scheme))
+	assert.NoError(t, operatorv1.AddToScheme(scheme))
+	assert.NoError(t, hyperv1.AddToScheme(scheme))
 
-	installNamespace := "open-cluster-management-addon-observability"
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			// Add platform resources
+			defaultAgentResources := []client.Object{}
+			platformScrapeConfig := &cooprometheusv1alpha1.ScrapeConfig{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       cooprometheusv1alpha1.ScrapeConfigsKind,
+					APIVersion: cooprometheusv1alpha1.SchemeGroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "platform",
+					Namespace: hubNamespace,
+					Labels:    config.PlatformPrometheusMatchLabels,
+				},
+				Spec: cooprometheusv1alpha1.ScrapeConfigSpec{},
+			}
+			platformScrapeConfigAdditional := platformScrapeConfig.DeepCopy() // Checks that the helm loop is well set
+			platformScrapeConfigAdditional.Name = platformScrapeConfigAdditional.Name + "- additional"
+			defaultAgentResources = append(defaultAgentResources, platformScrapeConfig, platformScrapeConfigAdditional)
+			platformRules := &prometheusv1.PrometheusRule{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       prometheusv1.PrometheusRuleKind,
+					APIVersion: prometheusv1.SchemeGroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "platform",
+					Namespace: hubNamespace,
+					Labels:    config.PlatformPrometheusMatchLabels,
+				},
+				Spec: prometheusv1.PrometheusRuleSpec{},
+			}
+			platformRulesAdditional := platformRules.DeepCopy() // Checks that the helm loop is well set
+			platformRulesAdditional.Name = platformRulesAdditional.Name + "-additional"
+			defaultAgentResources = append(defaultAgentResources, platformRules, platformRulesAdditional)
+
+			// Add a configmap to the default agent resources
+			cm := &corev1.ConfigMap{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "ConfigMap",
+					APIVersion: "v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-configmap",
+					Namespace: hubNamespace,
+				},
+				Data: map[string]string{
+					"key": "value",
+				},
+			}
+			defaultAgentResources = append(defaultAgentResources, cm)
+
+			// add a cluster id
+			clusterVersion := &configv1.ClusterVersion{
+				ObjectMeta: metav1.ObjectMeta{Name: "version"},
+				Spec: configv1.ClusterVersionSpec{
+					ClusterID: configv1.ClusterID(testClusterID),
+				},
+			}
+
+			defaultAgentResources = append(defaultAgentResources, clusterVersion)
+
+			// Add user workload resources
+			configReferences := []addonapiv1beta1.ConfigReference{}
+			for _, obj := range defaultAgentResources {
+				configReferences = append(configReferences, newConfigReference(obj))
+			}
+
+			clientObjects := []client.Object{}
+			clientObjects = append(clientObjects, defaultAgentResources...)
+
+			// Add uwl scrape configs
+			uwlScrapeConfig := platformScrapeConfig.DeepCopy()
+			uwlScrapeConfig.Name = "uwl-scrape-config"
+			uwlScrapeConfig.Labels = config.UserWorkloadPrometheusMatchLabels
+			uwlScrapeConfigAdditional := uwlScrapeConfig.DeepCopy() // Checks that the helm loop is well set
+			uwlScrapeConfigAdditional.Name = "uwl-scrape-config-additional"
+			configReferences = append(configReferences, newConfigReference(uwlScrapeConfig), newConfigReference(uwlScrapeConfigAdditional))
+			clientObjects = append(clientObjects, uwlScrapeConfig, uwlScrapeConfigAdditional)
+
+			// Add uwl rules
+			uwlRules := platformRules.DeepCopy()
+			uwlRules.Name = "uwl-rules"
+			uwlRules.Labels = config.UserWorkloadPrometheusMatchLabels
+			uwlRulesAdditional := uwlRules.DeepCopy()
+			uwlRulesAdditional.Name = "uwl-rules-additional"
+			uwlRulesAdditional.Annotations = map[string]string{config.TargetNamespaceAnnotation: "target-namespace"}
+			configReferences = append(configReferences, newConfigReference(uwlRules), newConfigReference(uwlRulesAdditional))
+			clientObjects = append(clientObjects, uwlRules, uwlRulesAdditional)
+
+			// Add uwl COO rules (monitoring.rhobs)
+			uwlCooRule := &cooprometheusv1.PrometheusRule{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       cooprometheusv1.PrometheusRuleKind,
+					APIVersion: cooprometheusv1.SchemeGroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "uwl-coo-rules",
+					Namespace: hubNamespace,
+					Labels:    config.UserWorkloadPrometheusMatchLabels,
+				},
+				Spec: cooprometheusv1.PrometheusRuleSpec{},
+			}
+			uwlCooRuleAdditional := uwlCooRule.DeepCopy()
+			uwlCooRuleAdditional.Name = "uwl-coo-rules-additional"
+			configReferences = append(configReferences, newConfigReference(uwlCooRule), newConfigReference(uwlCooRuleAdditional))
+			clientObjects = append(clientObjects, uwlCooRule, uwlCooRuleAdditional)
+
+			// Add secrets needed for the agent connection to the hub
+			clientObjects = append(clientObjects, newSecret(config.HubCASecretName, hubNamespace))
+			clientObjects = append(clientObjects, newSecret(config.ClientCertSecretName, hubNamespace))
+
+			// Add alermanager secrets
+			clientObjects = append(clientObjects, newSecret(config.AlertmanagerAccessorSecretName, hubNamespace))
+			routerCertsSecret := newSecret(config.RouterDefaultCertsConfigMapObjKey.Name, config.RouterDefaultCertsConfigMapObjKey.Namespace)
+			routerCertsSecret.Data["tls.crt"] = []byte("toto")
+			clientObjects = append(clientObjects, routerCertsSecret)
+
+			// Add default ingress controller
+			clientObjects = append(clientObjects, &operatorv1.IngressController{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-ingress-operator",
+				},
+			})
+
+			// Setup a managed cluster
+			managedCluster := addontesting.NewManagedCluster("cluster-1")
+			managedCluster.Labels = map[string]string{
+				addoncfg.ManagedClusterLabelClusterID: testClusterID,
+			}
+			if tc.IsOCP {
+				managedCluster.Labels[clusterinfov1beta1.LabelKubeVendor] = string(clusterinfov1beta1.KubeVendorOpenShift)
+			}
+			if tc.IsHub {
+				managedCluster.Labels[clusterlifecycleconstants.SelfManagedClusterLabelKey] = "true"
+			}
+			clientObjects = append(clientObjects, managedCluster)
+
+			// Setup the ClusterManagementAddon (needed to generate default resources)
+			cmao := newCMOA()
+			clientObjects = append(clientObjects, cmao)
+
+			// Add addonDeploymentConfig
+			aodc := newAddonDeploymentConfig()
+			if tc.InstallNamespace != "" {
+				aodc.Spec.AgentInstallNamespace = tc.InstallNamespace
+			}
+
+			if len(tc.Registries) > 0 {
+				aodc.Spec.Registries = tc.Registries
+			}
+
+			if tc.ResourceReqs {
+				prometheusContainerID := "statefulsets:" + config.PlatformMetricsCollectorApp + ":prometheus"
+				operatorContainerID := "deployments:prometheus-operator:prometheus-operator"
+				aodc.Spec.ResourceRequirements = []addonapiv1beta1.ContainerResourceRequirements{
+					{
+						ContainerID: prometheusContainerID,
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("200m"),
+								corev1.ResourceMemory: resource.MustParse("256Mi"),
+							},
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("100m"),
+								corev1.ResourceMemory: resource.MustParse("128Mi"),
+							},
+						},
+					},
+					{
+						ContainerID: operatorContainerID,
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("150m"),
+								corev1.ResourceMemory: resource.MustParse("192Mi"),
+							},
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("75m"),
+								corev1.ResourceMemory: resource.MustParse("96Mi"),
+							},
+						},
+					},
+				}
+			}
+
+			clientObjects = append(clientObjects, aodc)
+			configReferences = append(configReferences, newConfigReference(aodc))
+
+			// Images overrides configMap
+			imagesCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      config.ImagesConfigMapObjKey.Name,
+					Namespace: config.ImagesConfigMapObjKey.Namespace,
+				},
+				Data: map[string]string{
+					"obo_prometheus_rhel9_operator": "quay.io/prometheus/obo-operator",
+					"prometheus_config_reloader":    "quay.io/prometheus/config-reloader",
+					"kube_rbac_proxy":               "quay.io/kube/rbac-proxy",
+					"kube_state_metrics":            "quay.io/kube/kube-state-metrics",
+					"node_exporter":                 "quay.io/kube/node-exporter",
+					"prometheus":                    "quay.io/prometheus/prometheus",
+				},
+			}
+			clientObjects = append(clientObjects, imagesCM)
+			clientObjects = append(clientObjects, newManifestWork("cluster-1", tc.COOIsInstalled))
+
+			// Setup the fake k8s client
+			client := fakeclient.NewClientBuilder().
+				WithInterceptorFuncs(ensureGVKIsSet(scheme)).
+				WithScheme(scheme).
+				WithObjects(clientObjects...).
+				Build()
+
+			// Setup the fake addon client
+			getter := mockAODCGetter{aodc}
+			addonConfigValuesFn := addonfactory.GetAddOnDeploymentConfigValues(
+				getter,
+				addonfactory.ToAddOnCustomizedVariableValues,
+				addonfactory.ToAddOnResourceRequirementsValues,
+			)
+
+			// generate default agent resources
+			images, err := config.GetImageOverrides(context.Background(), client, tc.Registries, klog.Background())
+			require.NoError(t, err)
+
+			addonOpts := newAddonOptions(true, true)
+			addonOpts.Registries = tc.Registries
+
+			defaultStack := internalres.DefaultStackResources{
+				Client:             client,
+				CMAO:               cmao,
+				AddonOptions:       addonOpts,
+				Logger:             klog.Background(),
+				KubeRBACProxyImage: images.KubeRBACProxy,
+				PrometheusImage:    images.Prometheus,
+			}
+
+			dc, err := defaultStack.Reconcile(context.Background())
+			require.NoError(t, err)
+			err = common.EnsureAddonConfig(context.Background(), klog.Background(), client, dc)
+			require.NoError(t, err)
+
+			promAgents := cooprometheusv1alpha1.PrometheusAgentList{}
+			err = client.List(context.Background(), &promAgents)
+			require.NoError(t, err)
+			require.Len(t, promAgents.Items, 2)
+			// Update the prometheus agents to reference the configmap
+			for i := range promAgents.Items {
+				promAgents.Items[i].Spec.ConfigMaps = append(promAgents.Items[i].Spec.ConfigMaps, "my-configmap")
+				err = client.Update(context.Background(), &promAgents.Items[i])
+				require.NoError(t, err)
+			}
+
+			// Get updated agents for config references (they have proper GVK after update)
+			updatedPromAgents := cooprometheusv1alpha1.PrometheusAgentList{}
+			err = client.List(context.Background(), &updatedPromAgents)
+			require.NoError(t, err)
+
+			configReferences = append(configReferences, newConfigReference(&updatedPromAgents.Items[0]), newConfigReference(&updatedPromAgents.Items[1]))
+
+			// Register the addon for the managed cluster
+			managedClusterAddOn := addontesting.NewAddon("test", "cluster-1")
+			managedClusterAddOn.Status.ConfigReferences = []addonapiv1beta1.ConfigReference{}
+			managedClusterAddOn.Status.ConfigReferences = append(managedClusterAddOn.Status.ConfigReferences, configReferences...)
+
+			// Wire everything together to a fake addon instance
+			agentAddon, err := addonfactory.NewAgentAddonFactory(addoncfg.Name, addon.FS, addoncfg.MetricsChartDir).
+				WithGetValuesFuncs(addonConfigValuesFn, fakeGetValues(client, tc.PlatformMetrics, tc.UserMetrics, tc.InstallNamespace, aodc.Spec.ResourceRequirements, tc.Registries, tc.NodeExporterOpts)).
+				WithAgentRegistrationOption(&agent.RegistrationOption{}).
+				WithAgentInstallNamespace(
+					// Set agent install namespace from addon deployment config if it exists
+					utils.AgentInstallNamespaceFromDeploymentConfigFunc(
+						getter,
+					),
+				).
+				WithScheme(scheme).
+				BuildHelmAgentAddon()
+			if err != nil {
+				klog.Fatalf("failed to build agent %v", err)
+			}
+
+			// Render manifests and return them as k8s runtime objects
+			objects, err := agentAddon.Manifests(t.Context(), managedCluster, managedClusterAddOn)
+			require.NoError(t, err)
+			clientObjs := runtimeToClientObjects(t, objects)
+
+			tc.Expects(t, clientObjs)
+
+			// Check common properties of the objects
+			for _, obj := range objects {
+				accessor, err := meta.Accessor(obj)
+				require.NoError(t, err)
+
+				// if not a global object, check namespace
+				// secrets are possible to install in multiple namespaces (such as openshift-monitoring)
+				// and are therefore also ignored.
+				if !slices.Contains([]string{"ClusterRole", "ClusterRoleBinding", "CustomResourceDefinition", "Secret", "Namespace"}, obj.GetObjectKind().GroupVersionKind().Kind) {
+					if obj.GetObjectKind().GroupVersionKind().Kind == "PrometheusRule" && accessor.GetName() == "uwl-rules-additional" {
+						assert.Equal(t, "target-namespace", accessor.GetNamespace(), "Object: %s/%s", obj.GetObjectKind().GroupVersionKind(), accessor.GetName())
+					} else {
+						installNamespace := addonfactory.AddonDefaultInstallNamespace
+						if tc.InstallNamespace != "" {
+							installNamespace = tc.InstallNamespace
+						}
+						assert.Equal(t, installNamespace, accessor.GetNamespace(), "Object: %s/%s", obj.GetObjectKind().GroupVersionKind(), accessor.GetName())
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHelmBuild_Metrics_HCP(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, kubescheme.AddToScheme(scheme))
+	assert.NoError(t, cooprometheusv1alpha1.AddToScheme(scheme))
+	assert.NoError(t, prometheusv1.AddToScheme(scheme))
+	assert.NoError(t, cooprometheusv1.AddToScheme(scheme))
+	assert.NoError(t, clusterv1.Install(scheme))
+	assert.NoError(t, hyperv1.AddToScheme(scheme))
+	assert.NoError(t, addonapiv1beta1.Install(scheme))
+	assert.NoError(t, workv1.Install(scheme))
+	assert.NoError(t, operatorv1.AddToScheme(scheme))
+
+	// installNamespace := "open-cluster-management-addon-observability"
 	hubNamespace := "open-cluster-management-observability"
 
-	// Add platform resources
-	defaultAgentResources := resource.DefaultPlaftformAgentResources(hubNamespace)
-	platformScrapeConfig := &prometheusalpha1.ScrapeConfig{
+	// Add user workload resources
+	defaultAgentResources := []client.Object{}
+
+	configReferences := []addonapiv1beta1.ConfigReference{}
+	for _, obj := range defaultAgentResources {
+		configReferences = append(configReferences, newConfigReference(obj))
+	}
+
+	// add a cluster id
+	clusterVersion := &configv1.ClusterVersion{
+		ObjectMeta: metav1.ObjectMeta{Name: "version"},
+		Spec: configv1.ClusterVersionSpec{
+			ClusterID: configv1.ClusterID(testClusterID),
+		},
+	}
+
+	defaultAgentResources = append(defaultAgentResources, clusterVersion)
+
+	clientObjects := []client.Object{}
+	clientObjects = append(clientObjects, defaultAgentResources...)
+
+	// Add hcp scrape configs and rules
+	etcdHcpScrapeConfig := &cooprometheusv1alpha1.ScrapeConfig{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       prometheusalpha1.ScrapeConfigsKind,
-			APIVersion: prometheusalpha1.SchemeGroupVersion.Identifier(),
+			Kind:       cooprometheusv1alpha1.ScrapeConfigsKind,
+			APIVersion: cooprometheusv1alpha1.SchemeGroupVersion.Identifier(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "platform",
+			Name:      "etcd-base",
 			Namespace: hubNamespace,
-			Labels:    config.PlatformPrometheusMatchLabels,
+			Labels:    config.EtcdHcpUserWorkloadPrometheusMatchLabels,
 		},
-		Spec: prometheusalpha1.ScrapeConfigSpec{},
+		Spec: cooprometheusv1alpha1.ScrapeConfigSpec{
+			Params: map[string][]string{
+				"match[]": {
+					`{__name__="etcd_metric"}`,
+				},
+			},
+		},
 	}
-	platformScrapeConfigAdditional := platformScrapeConfig.DeepCopy() // Checks that the helm loop is well set
-	platformScrapeConfigAdditional.Name = platformScrapeConfigAdditional.Name + "- additional"
-	defaultAgentResources = append(defaultAgentResources, platformScrapeConfig, platformScrapeConfigAdditional)
-	platformRules := &prometheusv1.PrometheusRule{
+	apiserverHcpScrapeConfig := &cooprometheusv1alpha1.ScrapeConfig{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       cooprometheusv1alpha1.ScrapeConfigsKind,
+			APIVersion: cooprometheusv1alpha1.SchemeGroupVersion.Identifier(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "apiserver-base",
+			Namespace: hubNamespace,
+			Labels:    config.ApiserverHcpUserWorkloadPrometheusMatchLabels,
+		},
+		Spec: cooprometheusv1alpha1.ScrapeConfigSpec{
+			Params: map[string][]string{
+				"match[]": {
+					`{__name__="apiserver_metric"}`,
+				},
+			},
+		},
+	}
+	etcdHcpRule := &prometheusv1.PrometheusRule{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       prometheusv1.PrometheusRuleKind,
 			APIVersion: prometheusv1.SchemeGroupVersion.Identifier(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "platform",
+			Name:      "etcd-base",
 			Namespace: hubNamespace,
-			Labels:    config.PlatformPrometheusMatchLabels,
+			Labels:    config.EtcdHcpUserWorkloadPrometheusMatchLabels,
 		},
-		Spec: prometheusv1.PrometheusRuleSpec{},
+		Spec: prometheusv1.PrometheusRuleSpec{
+			Groups: []prometheusv1.RuleGroup{
+				{
+					Rules: []prometheusv1.Rule{
+						{
+							Expr: intstr.FromString("sum(etcd_rule_dependent_metric)"),
+						},
+					},
+				},
+			},
+		},
 	}
-	platformRulesAdditional := platformRules.DeepCopy() // Checks that the helm loop is well set
-	platformRulesAdditional.Name = platformRulesAdditional.Name + "-additional"
-	defaultAgentResources = append(defaultAgentResources, platformRules, platformRulesAdditional)
-
-	// Add user workload resources
-	defaultAgentResources = append(defaultAgentResources, resource.DefaultUserWorkloadAgentResources(hubNamespace)...)
-
-	configReferences := []addonapiv1alpha1.ConfigReference{}
-	for _, obj := range defaultAgentResources {
-		configReferences = append(configReferences, newConfigReference(obj))
+	apiserverHcpRule := &prometheusv1.PrometheusRule{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       prometheusv1.PrometheusRuleKind,
+			APIVersion: prometheusv1.SchemeGroupVersion.Identifier(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "apiserver-base",
+			Namespace: hubNamespace,
+			Labels:    config.ApiserverHcpUserWorkloadPrometheusMatchLabels,
+		},
+		Spec: prometheusv1.PrometheusRuleSpec{
+			Groups: []prometheusv1.RuleGroup{
+				{
+					Rules: []prometheusv1.Rule{
+						{
+							Expr: intstr.FromString("apiserver_rule_dependent_metric"),
+						},
+					},
+				},
+			},
+		},
 	}
 
-	clientObjects := []client.Object{}
-	clientObjects = append(clientObjects, defaultAgentResources...)
+	configReferences = append(configReferences, newConfigReference(etcdHcpScrapeConfig), newConfigReference(apiserverHcpScrapeConfig), newConfigReference(etcdHcpRule), newConfigReference(apiserverHcpRule))
+	clientObjects = append(clientObjects, etcdHcpScrapeConfig, apiserverHcpScrapeConfig, etcdHcpRule, apiserverHcpRule)
 
-	// Add uwl scrape configs
-	uwlScrapeConfig := platformScrapeConfig.DeepCopy()
-	uwlScrapeConfig.Name = "uwl-scrape-config"
-	uwlScrapeConfig.Labels = config.UserWorkloadPrometheusMatchLabels
-	uwlScrapeConfigAdditional := uwlScrapeConfig.DeepCopy() // Checks that the helm loop is well set
-	uwlScrapeConfigAdditional.Name = "uwl-scrape-config-additional"
-	configReferences = append(configReferences, newConfigReference(uwlScrapeConfig), newConfigReference(uwlScrapeConfigAdditional))
-	clientObjects = append(clientObjects, uwlScrapeConfig, uwlScrapeConfigAdditional)
-
-	// Add uwl rules
-	uwlRules := platformRules.DeepCopy()
-	uwlRules.Name = "uwl-rules"
-	uwlRules.Labels = config.UserWorkloadPrometheusMatchLabels
-	uwlRulesAdditional := uwlRules.DeepCopy()
-	uwlRulesAdditional.Name = "uwl-rules-additional"
-	configReferences = append(configReferences, newConfigReference(uwlRules), newConfigReference(uwlRulesAdditional))
-	clientObjects = append(clientObjects, uwlRules, uwlRulesAdditional)
+	// Add hypershift dependencies
+	hostedCluster := &hyperv1.HostedCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "a",
+			Namespace: "clusters",
+		},
+		Spec: hyperv1.HostedClusterSpec{
+			ClusterID: "cluster-id-a",
+		},
+	}
+	etcdSM := &prometheusv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "clusters-a",
+		},
+		Spec: prometheusv1.ServiceMonitorSpec{
+			Endpoints: []prometheusv1.Endpoint{
+				{
+					Port: "metrics",
+				},
+			},
+		},
+	}
+	apiserverSM := &prometheusv1.ServiceMonitor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kube-apiserver",
+			Namespace: "clusters-a",
+		},
+		Spec: prometheusv1.ServiceMonitorSpec{
+			Endpoints: []prometheusv1.Endpoint{
+				{
+					Port: "client",
+				},
+			},
+		},
+	}
+	clientObjects = append(clientObjects, hostedCluster, etcdSM, apiserverSM)
 
 	// Add secrets needed for the agent connection to the hub
 	clientObjects = append(clientObjects, newSecret(config.HubCASecretName, hubNamespace))
 	clientObjects = append(clientObjects, newSecret(config.ClientCertSecretName, hubNamespace))
 
-	// Setup a managed cluster
+	// Add alermanager secrets
+	clientObjects = append(clientObjects, newSecret(config.AlertmanagerAccessorSecretName, hubNamespace))
+	routerCertsSecret := newSecret(config.RouterDefaultCertsConfigMapObjKey.Name, config.RouterDefaultCertsConfigMapObjKey.Namespace)
+	routerCertsSecret.Data["tls.crt"] = []byte("toto")
+	clientObjects = append(clientObjects, routerCertsSecret)
+
+	// Add default ingress controller
+	clientObjects = append(clientObjects, &operatorv1.IngressController{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-ingress-operator",
+		},
+	})
+
+	// Setup a the local cluster as managed cluster
 	managedCluster := addontesting.NewManagedCluster("cluster-1")
+	managedCluster.Labels = map[string]string{
+		addoncfg.ManagedClusterLabelClusterID: testClusterID,
+		config.LocalManagedClusterLabel:       "true",
+		config.HypershiftAddonStateLabel:      "available",
+		clusterinfov1beta1.LabelKubeVendor:    string(clusterinfov1beta1.KubeVendorOpenShift),
+	}
 	clientObjects = append(clientObjects, managedCluster)
 
 	// Images overrides configMap
@@ -184,73 +1053,96 @@ func TestHelmBuild_Metrics_All(t *testing.T) {
 			Namespace: hubNamespace,
 		},
 		Data: map[string]string{
-			"prometheus_operator":        "registry.redhat.io/rhacm2/acm-prometheus-rhel9@sha256:4234bab8666dad7917cfcf10fdaed87b60e549ef6f8fb23d1760881d922e03e9",
-			"prometheus_config_reloader": "registry.redhat.io/rhacm2/acm-prometheus-config-reloader-rhel9@sha256:ab1632ec7aca478cf368e80ac9d98da3f2306a0cae8a4e9d29f95e149fd47ced",
-			"kube_rbac_proxy":            "registry.redhat.io/rhacm2/kube-rbac-proxy-rhel9@sha256:c60a1d52359493a41b2b6f820d11716d67290e9b83dc18c16039dbc6f120e5f2",
+			"obo_prometheus_rhel9_operator": "quay.io/prometheus/obo-operator",
+			"prometheus_config_reloader":    "quay.io/prometheus/config-reloader",
+			"kube_rbac_proxy":               "quay.io/kube/rbac-proxy",
+			"kube_state_metrics":            "quay.io/kube/kube-state-metrics",
+			"node_exporter":                 "quay.io/kube/node-exporter",
+			"prometheus":                    "quay.io/prometheus/prometheus",
 		},
 	}
 	clientObjects = append(clientObjects, imagesCM)
 
+	cmao := newCMOA()
+	clientObjects = append(clientObjects, cmao)
+
 	// Setup the fake k8s client
 	client := fakeclient.NewClientBuilder().
+		WithInterceptorFuncs(ensureGVKIsSet(scheme)).
 		WithScheme(scheme).
 		WithObjects(clientObjects...).
 		Build()
 
 	// Setup the fake addon client
-	addonClient := fakeaddon.NewSimpleClientset(newAddonDeploymentConfig())
+	getter := mockAODCGetter{newAddonDeploymentConfig()}
 	addonConfigValuesFn := addonfactory.GetAddOnDeploymentConfigValues(
-		addonfactory.NewAddOnDeploymentConfigGetter(addonClient),
+		getter,
 		addonfactory.ToAddOnCustomizedVariableValues,
 	)
 
+	// generate default agent resources
+	defaultStack := internalres.DefaultStackResources{
+		Client:       client,
+		CMAO:         cmao,
+		AddonOptions: newAddonOptions(true, true),
+		Logger:       klog.Background(),
+	}
+	dc, err := defaultStack.Reconcile(context.Background())
+	require.NoError(t, err)
+	err = common.EnsureAddonConfig(context.Background(), klog.Background(), client, dc)
+	require.NoError(t, err)
+
+	promAgents := cooprometheusv1alpha1.PrometheusAgentList{}
+	err = client.List(context.Background(), &promAgents)
+	require.NoError(t, err)
+	require.Len(t, promAgents.Items, 2)
+	configReferences = append(configReferences, newConfigReference(&promAgents.Items[0]), newConfigReference(&promAgents.Items[1]))
+
 	// Register the addon for the managed cluster
 	managedClusterAddOn := addontesting.NewAddon("test", "cluster-1")
-	managedClusterAddOn.Spec.InstallNamespace = installNamespace
-	managedClusterAddOn.Status.ConfigReferences = []addonapiv1alpha1.ConfigReference{}
+	managedClusterAddOn.Status.ConfigReferences = []addonapiv1beta1.ConfigReference{}
 	managedClusterAddOn.Status.ConfigReferences = append(managedClusterAddOn.Status.ConfigReferences, configReferences...)
 
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// Wire everything together to a fake addon instance
-			agentAddon, err := addonfactory.NewAgentAddonFactory(addon.Name, addon.FS, addon.MetricsChartDir).
-				WithGetValuesFuncs(addonConfigValuesFn, fakeGetValues(client, tc.PlatformMetrics, tc.UserMetrics)).
-				WithAgentRegistrationOption(&agent.RegistrationOption{}).
-				WithScheme(scheme).
-				BuildHelmAgentAddon()
-			if err != nil {
-				klog.Fatalf("failed to build agent %v", err)
-			}
-
-			// Render manifests and return them as k8s runtime objects
-			objects, err := agentAddon.Manifests(managedCluster, managedClusterAddOn)
-			assert.NoError(t, err)
-			clientObjs := runtimeToClientObjects(t, objects)
-
-			tc.Expects(t, clientObjs)
-
-			// Check common properties of the objects
-			for _, obj := range objects {
-				accessor, err := meta.Accessor(obj)
-				assert.NoError(t, err)
-
-				// if not a global object, check namespace
-				if !slices.Contains([]string{"ClusterRole", "ClusterRoleBinding"}, obj.GetObjectKind().GroupVersionKind().Kind) {
-					assert.Equal(t, installNamespace, accessor.GetNamespace(), fmt.Sprintf("Object: %s/%s", obj.GetObjectKind().GroupVersionKind(), accessor.GetName()))
-				}
-			}
-		})
+	// Wire everything together to a fake addon instance
+	agentAddon, err := addonfactory.NewAgentAddonFactory(addoncfg.Name, addon.FS, addoncfg.MetricsChartDir).
+		WithGetValuesFuncs(addonConfigValuesFn, fakeGetValues(client, false, true, "", nil, nil, addon.NodeExporterOptions{})).
+		WithAgentRegistrationOption(&agent.RegistrationOption{}).
+		WithScheme(scheme).
+		BuildHelmAgentAddon()
+	if err != nil {
+		klog.Fatalf("failed to build agent %v", err)
 	}
+
+	// Render manifests and return them as k8s runtime objects
+	objects, err := agentAddon.Manifests(t.Context(), managedCluster, managedClusterAddOn)
+	require.NoError(t, err)
+	clientObjs := runtimeToClientObjects(t, objects)
+
+	recordingRules := common.FilterResourcesByLabelSelector[*prometheusv1.PrometheusRule](clientObjs, nil)
+	assert.Len(t, recordingRules, 2)
+	scrapeConfigs := common.FilterResourcesByLabelSelector[*cooprometheusv1alpha1.ScrapeConfig](clientObjs, nil)
+	assert.Len(t, scrapeConfigs, 2)
+	serviceMonitors := common.FilterResourcesByLabelSelector[*prometheusv1.ServiceMonitor](clientObjs, nil)
+	assert.Len(t, serviceMonitors, 4) // 2 for hcps and 1 for meta monitoring, 1 for obo-prometheus operator
+	// keep only hcps serviceMonitors
+	serviceMonitors = slices.DeleteFunc(serviceMonitors, func(e *prometheusv1.ServiceMonitor) bool { return e.Namespace != "clusters-a" })
+	assert.Len(t, serviceMonitors, 2)
+	assert.Len(t, serviceMonitors[0].Spec.Endpoints, 1)
+	assert.Len(t, serviceMonitors[1].Spec.Endpoints, 1)
 }
 
-func newAddonDeploymentConfig() *addonapiv1alpha1.AddOnDeploymentConfig {
-	return &addonapiv1alpha1.AddOnDeploymentConfig{
+func newAddonDeploymentConfig() *addonapiv1beta1.AddOnDeploymentConfig {
+	return &addonapiv1beta1.AddOnDeploymentConfig{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "AddOnDeploymentConfig",
+			APIVersion: addonapiv1beta1.GroupVersion.String(),
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "multicluster-observability-addon",
 			Namespace: "open-cluster-management-observability",
 		},
-		Spec: addonapiv1alpha1.AddOnDeploymentConfigSpec{
-			CustomizedVariables: []addonapiv1alpha1.CustomizedVariable{
+		Spec: addonapiv1beta1.AddOnDeploymentConfigSpec{
+			CustomizedVariables: []addonapiv1beta1.CustomizedVariable{
 				{
 					Name:  "loggingSubscriptionChannel",
 					Value: "stable-5.9",
@@ -273,21 +1165,41 @@ func newSecret(name, ns string) *corev1.Secret {
 	}
 }
 
-func fakeGetValues(k8s client.Client, platformMetrics, userWorkloadMetrics bool) addonfactory.GetValuesFunc {
+func fakeGetValues(k8s client.Client, platformMetrics, userWorkloadMetrics bool, installNs string, resReqs []addonapiv1beta1.ContainerResourceRequirements, registries []addonapiv1beta1.ImageMirror, nodeExporterOpts addon.NodeExporterOptions) addonfactory.GetValuesFunc {
 	return func(
 		cluster *clusterv1.ManagedCluster,
-		mcAddon *addonapiv1alpha1.ManagedClusterAddOn,
+		mcAddon *addonapiv1beta1.ManagedClusterAddOn,
 	) (addonfactory.Values, error) {
 		optionsBuilder := handlers.OptionsBuilder{
 			Client: k8s,
-			ImagesConfigMap: types.NamespacedName{
-				Name:      "images-list",
-				Namespace: "open-cluster-management-observability",
-			},
-			RemoteWriteURL: "https://observatorium-api-open-cluster-management-observability.apps.sno-4xlarge-416-lqsr2.dev07.red-chesterfield.com/api/metrics/v1/default/api/v1/receive",
 		}
 
-		opts, err := optionsBuilder.Build(context.Background(), mcAddon, cluster, addon.MetricsOptions{CollectionEnabled: platformMetrics}, addon.MetricsOptions{CollectionEnabled: userWorkloadMetrics})
+		hubEp, _ := url.Parse("http://remote-write.example.com")
+
+		addonOpts := addon.Options{
+			Platform: addon.PlatformOptions{
+				Metrics: addon.MetricsOptions{
+					CollectionEnabled: platformMetrics,
+					HubEndpoint:       *hubEp,
+					NodeExporter:      nodeExporterOpts,
+				},
+			},
+			UserWorkloads: addon.UserWorkloadOptions{
+				Metrics: addon.MetricsOptions{CollectionEnabled: userWorkloadMetrics},
+			},
+			Registries: registries,
+		}
+
+		if installNs != "" {
+			addonOpts.InstallNamespace = installNs
+		}
+
+		if resReqs != nil {
+			addonOpts.ResourceReqs = resReqs
+		}
+
+		// opts, err := optionsBuilder.Build(context.Background(), mcAddon, cluster, addon.MetricsOptions{CollectionEnabled: platformMetrics, HubEndpoint: hubEp}, addon.MetricsOptions{CollectionEnabled: userWorkloadMetrics})
+		opts, err := optionsBuilder.Build(context.Background(), mcAddon, cluster, addonOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -301,19 +1213,20 @@ func fakeGetValues(k8s client.Client, platformMetrics, userWorkloadMetrics bool)
 	}
 }
 
-func newConfigReference(obj client.Object) addonapiv1alpha1.ConfigReference {
+func newConfigReference(obj client.Object) addonapiv1beta1.ConfigReference {
 	resource := strings.ToLower(obj.GetObjectKind().GroupVersionKind().Kind) + "s"
 
-	return addonapiv1alpha1.ConfigReference{
-		ConfigGroupResource: addonapiv1alpha1.ConfigGroupResource{
+	return addonapiv1beta1.ConfigReference{
+		ConfigGroupResource: addonapiv1beta1.ConfigGroupResource{
 			Group:    obj.GetObjectKind().GroupVersionKind().Group,
 			Resource: resource,
 		},
-		DesiredConfig: &addonapiv1alpha1.ConfigSpecHash{
-			ConfigReferent: addonapiv1alpha1.ConfigReferent{
+		DesiredConfig: &addonapiv1beta1.ConfigSpecHash{
+			ConfigReferent: addonapiv1beta1.ConfigReferent{
 				Namespace: obj.GetNamespace(),
 				Name:      obj.GetName(),
 			},
+			SpecHash: "dummy",
 		},
 	}
 }
@@ -329,4 +1242,195 @@ func runtimeToClientObjects(t *testing.T, objs []runtime.Object) []client.Object
 
 	}
 	return clientObjs
+}
+
+func formatObjects(objects []client.Object) string {
+	s := []string{}
+	for _, o := range objects {
+		s = append(s, fmt.Sprintf("%s/%s/%s", o.GetObjectKind().GroupVersionKind().Kind, o.GetNamespace(), o.GetName()))
+	}
+	return strings.Join(s, "\n")
+}
+
+func newAddonOptions(platformEnabled, uwlEnabled bool) addon.Options {
+	hubEp, _ := url.Parse("http://remote-write.example.com")
+	return addon.Options{
+		Platform: addon.PlatformOptions{
+			Metrics: addon.MetricsOptions{
+				CollectionEnabled: platformEnabled,
+				HubEndpoint:       *hubEp,
+			},
+		},
+		UserWorkloads: addon.UserWorkloadOptions{
+			Metrics: addon.MetricsOptions{
+				CollectionEnabled: uwlEnabled,
+			},
+		},
+	}
+}
+
+func newCMOA() *addonapiv1beta1.ClusterManagementAddOn {
+	return &addonapiv1beta1.ClusterManagementAddOn{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: addoncfg.Name,
+			UID:  types.UID("test-cmao-uid"),
+		},
+		Spec: addonapiv1beta1.ClusterManagementAddOnSpec{
+			InstallStrategy: addonapiv1beta1.InstallStrategy{
+				Placements: []addonapiv1beta1.PlacementStrategy{
+					{
+						PlacementRef: addonapiv1beta1.PlacementRef{
+							Namespace: "placement-ns",
+							Name:      "placement-name",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func newManifestWork(name string, isOLMSubscrided bool) *workv1.ManifestWork {
+	return &workv1.ManifestWork{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: name,
+			Labels: map[string]string{
+				addonapiv1beta1.AddonLabelKey: addoncfg.Name,
+			},
+		},
+		Status: workv1.ManifestWorkStatus{
+			ResourceStatus: workv1.ManifestResourceStatus{
+				Manifests: []workv1.ManifestCondition{
+					{
+						ResourceMeta: workv1.ManifestResourceMeta{
+							Group:    apiextensionsv1.GroupName,
+							Resource: "customresourcedefinitions",
+							Name:     fmt.Sprintf("%s.%s", cooprometheusv1alpha1.PrometheusAgentName, cooprometheusv1alpha1.SchemeGroupVersion.Group),
+						},
+						StatusFeedbacks: workv1.StatusFeedbackResult{
+							Values: []workv1.FeedbackValue{
+								{
+									Name: addoncfg.IsEstablishedFeedbackName,
+									Value: workv1.FieldValue{
+										Type:   workv1.String,
+										String: ptr.To("True"),
+									},
+								},
+								{
+									Name: addoncfg.LastTransitionTimeFeedbackName,
+									Value: workv1.FieldValue{
+										Type:   workv1.String,
+										String: ptr.To("12:00"),
+									},
+								},
+							},
+						},
+					},
+					{
+						ResourceMeta: workv1.ManifestResourceMeta{
+							Group:    apiextensionsv1.GroupName,
+							Resource: "customresourcedefinitions",
+							Name:     fmt.Sprintf("%s.%s", cooprometheusv1alpha1.ScrapeConfigName, cooprometheusv1alpha1.SchemeGroupVersion.Group),
+						},
+						StatusFeedbacks: workv1.StatusFeedbackResult{
+							Values: []workv1.FeedbackValue{
+								{
+									Name: addoncfg.IsEstablishedFeedbackName,
+									Value: workv1.FieldValue{
+										Type:   workv1.String,
+										String: ptr.To("True"),
+									},
+								},
+								{
+									Name: addoncfg.LastTransitionTimeFeedbackName,
+									Value: workv1.FieldValue{
+										Type:   workv1.String,
+										String: ptr.To("12:00"),
+									},
+								},
+							},
+						},
+					},
+					{
+						ResourceMeta: workv1.ManifestResourceMeta{
+							Group:    apiextensionsv1.GroupName,
+							Resource: "customresourcedefinitions",
+							Name:     config.MonitoringStackCRDName,
+						},
+						StatusFeedbacks: workv1.StatusFeedbackResult{
+							Values: []workv1.FeedbackValue{
+								{
+									Name: addoncfg.IsOLMManagedFeedbackName,
+									Value: workv1.FieldValue{
+										Type:   workv1.String,
+										String: ptr.To(cases.Title(language.English).String(strconv.FormatBool(isOLMSubscrided))),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func ensureGVKIsSet(scheme *runtime.Scheme) interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, clientww client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			err := clientww.Get(ctx, key, obj, opts...)
+			if err != nil {
+				return err
+			}
+			gvk, err := apiutil.GVKForObject(obj, scheme)
+			if err == nil {
+				obj.GetObjectKind().SetGroupVersionKind(gvk)
+			}
+			return nil
+		},
+		Patch: func(ctx context.Context, clientww client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			gvk, _ := apiutil.GVKForObject(obj, scheme)
+			if !gvk.Empty() {
+				obj.GetObjectKind().SetGroupVersionKind(gvk)
+			}
+			err := clientww.Patch(ctx, obj, patch, opts...)
+			if err == nil && !gvk.Empty() {
+				obj.GetObjectKind().SetGroupVersionKind(gvk)
+			}
+			return err
+		},
+		List: func(ctx context.Context, clientww client.WithWatch, obj client.ObjectList, opts ...client.ListOption) error {
+			err := clientww.List(ctx, obj, opts...)
+			if err != nil {
+				return err
+			}
+			return meta.EachListItem(obj, func(object runtime.Object) error {
+				gvk, err := apiutil.GVKForObject(object, scheme)
+				if err != nil {
+					return nil
+				}
+				object.GetObjectKind().SetGroupVersionKind(gvk)
+				return nil
+			})
+		},
+	}
+}
+
+func findServicePortByName(ports []corev1.ServicePort, name string) *corev1.ServicePort {
+	for i := range ports {
+		if ports[i].Name == name {
+			return &ports[i]
+		}
+	}
+	return nil
+}
+
+func findContainerPortByName(ports []corev1.ContainerPort, name string) *corev1.ContainerPort {
+	for i := range ports {
+		if ports[i].Name == name {
+			return &ports[i]
+		}
+	}
+	return nil
 }

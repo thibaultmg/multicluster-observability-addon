@@ -1,0 +1,11 @@
+{{- if and .Values.enabled .Values.installCOO }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-cluster-observability-operator
+  labels:
+    app: {{ template "coohelm.name" . }}
+    chart: {{ template "coohelm.chart" . }}
+    release: {{ .Release.Name }}
+    openshift.io/cluster-monitoring: "true"
+{{- end }}

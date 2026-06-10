@@ -1,0 +1,110 @@
+{{- if .Values.deployNonOCPStack }}
+apiVersion: monitoring.rhobs/v1
+kind: Prometheus
+metadata:
+  name: {{ .Values.prometheusServerName }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    operator.prometheus.io/controller-id: {{ .Values.prometheusControllerID }}
+  labels:
+    {{- include "prometheus.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml .Values.nodeSelector | nindent 4 }}
+  {{- else }}
+  nodeSelector:
+    kubernetes.io/os: linux
+  {{- end }}
+  {{- if .Values.tolerations }}
+  tolerations:
+    {{- toYaml .Values.tolerations | nindent 4 }}
+  {{- end }}
+  serviceAccountName: {{ .Values.prometheusServerName }}
+  secrets:
+    - {{ .Values.alertmanagerRouterCASecretName }}
+    - {{ .Values.alertmanagerAccessorSecretName }}
+  serviceMonitorSelector: {}
+  resources:
+    requests:
+      memory: 400Mi
+  externalLabels:
+    managed_cluster: CLUSTER
+  listenLocal: true
+  initContainers:
+    - name: init-config-reloader
+      resources:
+        requests:
+          cpu: 1m
+          memory: 200Mi
+        limits:
+          cpu: 10m
+          memory: 300Mi
+  containers:
+    - args:
+      - --logtostderr
+      - --secure-listen-address=$(IP):9091
+      - --tls-cipher-suites=TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+      - --upstream=http://127.0.0.1:9090/
+      env:
+      - name: IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+      image: {{ .Values.images.rbacProxyImage }}
+      name: kube-rbac-proxy
+      ports:
+      - containerPort: 9091
+        name: https
+      resources:
+      {{- $matched := false }}
+      {{- if .Values.global.resourceRequirements }}
+      {{- $reverseResourceRequirements := reverse .Values.global.resourceRequirements -}}
+      {{- range $requirement := $reverseResourceRequirements -}}
+        {{- if regexMatch $requirement.containerIDRegex (printf "statefulsets:%s:%s" $.Values.prometheusServerName "kube-rbac-proxy") }}
+          {{- $matched = true }}
+          {{- toYaml $requirement.resources | nindent 10 }}
+          {{- break -}}
+        {{- end -}}
+      {{- end }}
+      {{- end }}
+      {{- if not $matched }}
+        limits:
+          cpu: 20m
+          memory: 400Mi
+        requests:
+          cpu: 10m
+          memory: 200Mi
+      {{- end }}
+    - name: config-reloader
+      resources:
+        requests:
+          cpu: 1m
+          memory: 200Mi
+        limits:
+          cpu: 10m
+          memory: 400Mi
+  podMetadata:
+    annotations:
+      target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
+    labels:
+      {{- include "prometheus.selectorLabels" . | nindent 6 }}
+  podMonitorSelector: {}
+  serviceMonitorNamespaceSelector: {}
+  rules:
+    alert: {}
+  arbitraryFSAccessThroughSMs: {}
+  image: {{ .Values.images.prometheus }}
+  replicas: 1
+  ruleSelector: {}
+  ruleNamespaceSelector: {}
+  retention: 24h
+  additionalScrapeConfigs:
+    name: prometheus-scrape-targets
+    key: scrape-targets.yaml
+  {{- if .Values.alertManagerEndpoint }}
+  additionalAlertManagerConfigs:
+    name: prometheus-alertmanager
+    key: alertmanager.yaml
+  {{- end }}
+{{- end }}

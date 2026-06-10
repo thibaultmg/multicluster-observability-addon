@@ -1,0 +1,28 @@
+{{- if .Values.platformEnabled }}
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ include "mcoa.globalResourcePrefix" (printf "%s-role" .Values.platform.appName) }}
+  labels:
+    app.kubernetes.io/component: {{ .Values.platform.component }}
+    {{ include "metricshelm.labels" . | nindent 4 }}
+rules:
+  - verbs:
+      - get
+      - list
+      - watch
+    apiGroups:
+      - ''
+    resources:
+      - services
+      - endpoints
+      - pods
+  - verbs:
+      - get
+      - list
+      - watch
+    apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+{{- end }}

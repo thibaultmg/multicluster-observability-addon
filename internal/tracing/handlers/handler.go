@@ -7,11 +7,13 @@ import (
 
 	otelv1alpha1 "github.com/open-telemetry/opentelemetry-operator/apis/v1alpha1"
 	otelv1beta1 "github.com/open-telemetry/opentelemetry-operator/apis/v1beta1"
-	"github.com/rhobs/multicluster-observability-addon/internal/addon"
-	"github.com/rhobs/multicluster-observability-addon/internal/tracing/manifests"
+	"github.com/stolostron/multicluster-observability-addon/internal/addon"
+	"github.com/stolostron/multicluster-observability-addon/internal/addon/common"
+	addoncfg "github.com/stolostron/multicluster-observability-addon/internal/addon/config"
+	"github.com/stolostron/multicluster-observability-addon/internal/tracing/manifests"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
-	addonapiv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
+	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -25,14 +27,14 @@ var (
 	errMultipleOTELInstrRef   = errors.New("multiple Instrumentation references on addon installation")
 )
 
-func BuildOptions(ctx context.Context, k8s client.Client, mcAddon *addonapiv1alpha1.ManagedClusterAddOn, userWorkloads addon.TracesOptions) (manifests.Options, error) {
+func BuildOptions(ctx context.Context, k8s client.Client, mcAddon *addonapiv1beta1.ManagedClusterAddOn, userWorkloads addon.TracesOptions) (manifests.Options, error) {
 	opts := manifests.Options{
 		ClusterName:   mcAddon.Namespace,
 		UserWorkloads: userWorkloads,
 	}
 
 	klog.Info("Retrieving OpenTelemetry Collector template")
-	keys := addon.GetObjectKeys(mcAddon.Status.ConfigReferences, otelv1beta1.GroupVersion.Group, addon.OpenTelemetryCollectorsResource)
+	keys := common.GetObjectKeys(mcAddon.Status.ConfigReferences, otelv1beta1.GroupVersion.Group, addoncfg.OpenTelemetryCollectorsResource)
 	switch {
 	case len(keys) == 0:
 		return opts, errMissingOTELColRef
@@ -48,7 +50,7 @@ func BuildOptions(ctx context.Context, k8s client.Client, mcAddon *addonapiv1alp
 
 	if userWorkloads.InstrumentationEnabled {
 		klog.Info("Retrieving Instrumentation template")
-		keys := addon.GetObjectKeys(mcAddon.Status.ConfigReferences, otelv1beta1.GroupVersion.Group, addon.OpenTelemetryCollectorsResource)
+		keys := common.GetObjectKeys(mcAddon.Status.ConfigReferences, otelv1beta1.GroupVersion.Group, addoncfg.OpenTelemetryCollectorsResource)
 		switch {
 		case len(keys) == 0:
 			return opts, errMissingOTELInstrRef
@@ -68,7 +70,7 @@ func BuildOptions(ctx context.Context, k8s client.Client, mcAddon *addonapiv1alp
 		return opts, nil
 	}
 
-	secrets, err := addon.GetSecrets(ctx, k8s, otelCol.Namespace, mcAddon.Namespace, secretNames)
+	secrets, err := common.GetSecrets(ctx, k8s, otelCol.Namespace, mcAddon.Namespace, secretNames)
 	if err != nil {
 		return opts, err
 	}
@@ -114,17 +116,17 @@ func getVolumeMount(otelCol *otelv1beta1.OpenTelemetryCollector, secretName stri
 }
 
 // searchVolumeMountInExporter checks if the VolumeMount is used in any exporter
-func searchVolumeMountInExporter(vm v1.VolumeMount, exporters map[string]interface{}) (string, error) {
+func searchVolumeMountInExporter(vm v1.VolumeMount, exporters map[string]any) (string, error) {
 	for name, eMap := range exporters {
 		if eMap == nil {
 			continue
 		}
 
-		t, ok := eMap.(map[string]interface{})["tls"]
+		t, ok := eMap.(map[string]any)["tls"]
 		if !ok {
 			continue
 		}
-		tls := t.(map[string]interface{})
+		tls := t.(map[string]any)
 		if strings.HasPrefix(tls["cert_file"].(string), vm.MountPath) ||
 			strings.HasPrefix(tls["key_file"].(string), vm.MountPath) ||
 			strings.HasPrefix(tls["ca_file"].(string), vm.MountPath) {

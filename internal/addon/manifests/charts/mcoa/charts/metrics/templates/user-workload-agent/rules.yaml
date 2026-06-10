@@ -1,21 +1,23 @@
+{{- if .Values.userWorkloadsEnabled }}
 {{- range $_, $rule := .Values.userWorkload.rules }}
-apiVersion: monitoring.coreos.com/v1
+apiVersion: {{ $rule.apiVersion | default "monitoring.coreos.com/v1" }}
 kind: PrometheusRule
 metadata:
   name: {{ $rule.name }}
-  namespace: {{ $.Release.Namespace }}
+  namespace: {{ default $.Release.Namespace $rule.namespace }}
   labels:
     {{- $incomingLabels := $rule.labels }}
     {{- $metricsHelmLabels := fromYaml (include "metricshelm.labels" $) }}
-    {{- $customLabel := dict "app.kubernetes.io/component" "user-workload-metrics-collector" }}
-    {{- $mergedLabels := merge $incomingLabels $metricsHelmLabels $customLabel }}
+    {{- $customLabel := dict "app.kubernetes.io/component" $.Values.userWorkload.component }}
+    {{- $mergedLabels := mergeOverwrite $incomingLabels $metricsHelmLabels $customLabel }}
     {{- toYaml $mergedLabels | nindent 4 }}
   annotations:
     {{- $incomingAnnotations := $rule.annotations }}
     {{- $stdAnnotations := dict "operator.prometheus.io/controller-id" "openshift-user-workload-monitoring/prometheus-operator" }}
-    {{- $mergedAnnotations := merge $stdAnnotations $incomingAnnotations }}
+    {{- $mergedAnnotations := mergeOverwrite $incomingAnnotations $stdAnnotations }}
     {{- toYaml $mergedAnnotations | nindent 4 }}
 spec:
 {{ fromJson $rule.data | toYaml | nindent 2 }}
 ---
+{{- end }}
 {{- end }}

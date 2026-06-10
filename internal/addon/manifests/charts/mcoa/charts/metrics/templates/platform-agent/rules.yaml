@@ -1,0 +1,32 @@
+{{- if .Values.platformEnabled }}
+{{- range $_, $rule := .Values.platform.rules }}
+{{- if $.Values.deployNonOCPStack }}
+apiVersion: monitoring.rhobs/v1
+{{- else }}
+apiVersion: monitoring.coreos.com/v1
+{{- end }}
+kind: PrometheusRule
+metadata:
+  name: {{ $rule.name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- $incomingLabels := $rule.labels }}
+    {{- $metricsHelmLabels := fromYaml (include "metricshelm.labels" $) }}
+    {{- $customLabel := dict "app.kubernetes.io/component" $.Values.platform.component }}
+    {{- $mergedLabels := mergeOverwrite $incomingLabels $metricsHelmLabels $customLabel }}
+    {{- toYaml $mergedLabels | nindent 4 }}
+  annotations:
+    {{- $incomingAnnotations := $rule.annotations }}
+    {{- $stdAnnotations := dict }}
+    {{- if $.Values.deployNonOCPStack }}
+    {{- $_ := set $stdAnnotations "operator.prometheus.io/controller-id" $.Values.prometheusControllerID }}
+    {{- else }}
+    {{- $_ := set $stdAnnotations "operator.prometheus.io/controller-id" "openshift-monitoring/prometheus-operator" }}
+    {{- end }}
+    {{- $mergedAnnotations := mergeOverwrite $incomingAnnotations $stdAnnotations }}
+    {{- toYaml $mergedAnnotations | nindent 4 }}
+spec:
+{{ fromJson $rule.data | toYaml | nindent 2 }}
+---
+{{- end }}
+{{- end }}

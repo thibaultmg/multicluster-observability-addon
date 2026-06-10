@@ -2,6 +2,8 @@ nameOverride: null
 
 enabled: true
 
+installCLO: false
+
 clfAnnotations: {}
 
 # Expects json format

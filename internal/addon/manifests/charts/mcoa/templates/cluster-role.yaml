@@ -11,11 +11,18 @@ metadata:
     app: {{ template "mcoahelm.name" . }}
     chart: {{ template "mcoahelm.chart" . }}
     release: {{ .Release.Name }}
+    open-cluster-management.io/aggregate-to-work: "true"
 rules:
   - apiGroups: ["operators.coreos.com"]
     resources: ["operatorgroups"]
     verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
   - apiGroups: ["monitoring.coreos.com"]
-    resources: ["prometheusagents", "prometheusrules", "scrapeconfigs"]
+    resources: ["prometheusrules", "servicemonitors"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+  - apiGroups: ["monitoring.rhobs"]
+    resources: ["prometheusagents", "scrapeconfigs", "prometheusrules", "prometheuses", "monitoringstacks"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
     verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
 {{- end }}

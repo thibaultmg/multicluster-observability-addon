@@ -1,0 +1,35 @@
+{{- if .Values.deployNonOCPStack }}
+{{- $collectorsDict := include "kube-state-metrics.collectors" . | fromJson }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "mcoa.globalResourcePrefix" (include "kube-state-metrics.fullname" .) }}
+  labels:
+    {{- include "kube-state-metrics.labels" . | nindent 4 }}
+rules:
+{{- range $group := keys $collectorsDict | sortAlpha }}
+{{- $resources := index $collectorsDict $group }}
+- apiGroups:
+  - {{ $group | quote }}
+  resources:
+{{- range $resources | sortAlpha }}
+  - {{ . }}
+{{- end }}
+  verbs:
+  - get
+  - list
+  - watch
+{{- end }}
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+{{- end }}

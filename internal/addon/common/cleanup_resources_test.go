@@ -1,0 +1,234 @@
+package common
+
+import (
+	"context"
+	"testing"
+
+	cooprometheusv1alpha1 "github.com/rhobs/obo-prometheus-operator/pkg/apis/monitoring/v1alpha1"
+	addoncfg "github.com/stolostron/multicluster-observability-addon/internal/addon/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
+	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+func TestCleanOrphanResources(t *testing.T) {
+	// Setup common test variables
+	testNamespace := addoncfg.InstallNamespace
+	placementName := "test-placement"
+	placementNs := testNamespace
+	cmaoName := "test-cmao"
+
+	// Create a new scheme and add the types we need
+	scheme := runtime.NewScheme()
+	require.NoError(t, addonapiv1beta1.Install(scheme))
+	require.NoError(t, cooprometheusv1alpha1.AddToScheme(scheme))
+
+	tests := []struct {
+		name               string
+		cmao               *addonapiv1beta1.ClusterManagementAddOn
+		cmaoOwnedResources []*cooprometheusv1alpha1.PrometheusAgent
+		extraResources     []client.Object
+		expectDeleted      map[string]bool
+	}{
+		{
+			name: "No placement exists but resources exist not owned by CMAO",
+			cmao: &addonapiv1beta1.ClusterManagementAddOn{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: cmaoName,
+				},
+				Spec: addonapiv1beta1.ClusterManagementAddOnSpec{
+					// No placements
+				},
+			},
+			extraResources: []client.Object{
+				&cooprometheusv1alpha1.PrometheusAgent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "agent-1",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							addoncfg.PlacementRefNameLabelKey:      placementName,
+							addoncfg.PlacementRefNamespaceLabelKey: placementNs,
+						},
+						// Not owned by CMAO
+					},
+				},
+			},
+			expectDeleted: map[string]bool{
+				"agent-1": false, // Resource not owned by CMAO, shouldn't be deleted
+			},
+		},
+		{
+			name: "No placement but exist resources owned by CMAO",
+			cmao: &addonapiv1beta1.ClusterManagementAddOn{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: cmaoName,
+				},
+				Spec: addonapiv1beta1.ClusterManagementAddOnSpec{
+					// No placements
+				},
+			},
+			cmaoOwnedResources: []*cooprometheusv1alpha1.PrometheusAgent{
+				// Will be deleted because it's owned by CMAO but no placement
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "agent-2",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							addoncfg.PlacementRefNameLabelKey:      placementName,
+							addoncfg.PlacementRefNamespaceLabelKey: placementNs,
+						},
+						// Will be set as owned by CMAO in the test
+					},
+				},
+			},
+			expectDeleted: map[string]bool{
+				"agent-2": true, // Should be deleted as it's owned by CMAO and no placement exists
+			},
+		},
+		{
+			name: "Placement exists but also exists some resources not owned by CMAO",
+			cmao: &addonapiv1beta1.ClusterManagementAddOn{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: cmaoName,
+				},
+				Spec: addonapiv1beta1.ClusterManagementAddOnSpec{
+					InstallStrategy: addonapiv1beta1.InstallStrategy{
+						Placements: []addonapiv1beta1.PlacementStrategy{
+							{
+								PlacementRef: addonapiv1beta1.PlacementRef{
+									Name:      placementName,
+									Namespace: placementNs,
+								},
+							},
+						},
+					},
+				},
+			},
+			cmaoOwnedResources: []*cooprometheusv1alpha1.PrometheusAgent{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "agent-3",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							addoncfg.PlacementRefNameLabelKey:      placementName,
+							addoncfg.PlacementRefNamespaceLabelKey: placementNs,
+						},
+						// Not owned by CMAO
+					},
+				},
+			},
+			extraResources: []client.Object{
+				&cooprometheusv1alpha1.PrometheusAgent{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "agent-4",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							addoncfg.PlacementRefNameLabelKey:      placementName,
+							addoncfg.PlacementRefNamespaceLabelKey: placementNs,
+						},
+						// Not owned by CMAO
+					},
+				},
+			},
+			expectDeleted: map[string]bool{
+				"agent-3": false, // Not owned by CMAO, shouldn't be deleted
+				"agent-4": false, // Not owned by CMAO, shouldn't be deleted
+			},
+		},
+		{
+			name: "Placement exists but also exists some resources owned by CMAO",
+			cmao: &addonapiv1beta1.ClusterManagementAddOn{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: cmaoName,
+				},
+				Spec: addonapiv1beta1.ClusterManagementAddOnSpec{
+					InstallStrategy: addonapiv1beta1.InstallStrategy{
+						Placements: []addonapiv1beta1.PlacementStrategy{
+							{
+								PlacementRef: addonapiv1beta1.PlacementRef{
+									Name:      placementName,
+									Namespace: placementNs,
+								},
+							},
+						},
+					},
+				},
+			},
+			cmaoOwnedResources: []*cooprometheusv1alpha1.PrometheusAgent{
+				// Will not be deleted because it matches a placement
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "agent-5",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							addoncfg.PlacementRefNameLabelKey:      placementName,
+							addoncfg.PlacementRefNamespaceLabelKey: placementNs,
+						},
+						// Will be set as owned by CMAO in the test
+					},
+				},
+				// Will be deleted because it doesn't match any placement
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "agent-6",
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							addoncfg.PlacementRefNameLabelKey:      "other-placement",
+							addoncfg.PlacementRefNamespaceLabelKey: placementNs,
+						},
+						// Will be set as owned by CMAO in the test
+					},
+				},
+			},
+			expectDeleted: map[string]bool{
+				"agent-5": false, // Matches placement, shouldn't be deleted
+				"agent-6": true,  // Owned by CMAO but doesn't match any placement, should be deleted
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a fresh fake client for each test case
+			existingResources := []client.Object{tc.cmao}
+			existingResources = append(existingResources, tc.extraResources...)
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingResources...).Build()
+
+			// Set up existing resources with ownership as needed
+			for _, agent := range tc.cmaoOwnedResources {
+				err := controllerutil.SetControllerReference(tc.cmao, agent, scheme)
+				require.NoError(t, err, "Failed to set controller reference")
+
+				// Create the resource in the fake client
+				err = fakeClient.Create(context.Background(), agent)
+				require.NoError(t, err, "Failed to create resource")
+			}
+
+			// Run the function under test
+			err := DeleteOrphanResources(context.Background(), klog.Background(), fakeClient, tc.cmao, &cooprometheusv1alpha1.PrometheusAgentList{})
+			require.NoError(t, err, "CleanOrphanResources should not return an error")
+
+			// Check that resources were deleted or not as expected
+			for name, shouldBeDeleted := range tc.expectDeleted {
+				agent := &cooprometheusv1alpha1.PrometheusAgent{}
+				err := fakeClient.Get(context.Background(), types.NamespacedName{
+					Name:      name,
+					Namespace: testNamespace,
+				}, agent)
+
+				if shouldBeDeleted {
+					assert.Error(t, err, "Resource %s should have been deleted", name)
+				} else {
+					assert.NoError(t, err, "Resource %s should not have been deleted", name)
+				}
+			}
+		})
+	}
+}

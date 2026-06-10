@@ -11,6 +11,7 @@ VERSION ?= v0.0.1
 
 CRD_DIR := $(shell pwd)/deploy/crds
 BIN_DIR := $(CURDIR)/bin
+CONTAINER_ENGINE ?= $(shell which podman 2>/dev/null || which docker 2>/dev/null)
 
 # REGISTRY_BASE
 # defines the container registry and organization for the bundle and operator container images.
@@ -19,6 +20,7 @@ REGISTRY_BASE ?= $(REGISTRY_BASE_OPENSHIFT)
 
 # Image URL to use all building/pushing image targets
 IMG ?= $(REGISTRY_BASE)/multicluster-observability-addon:$(VERSION)
+PLATFORM ?= linux/amd64
 
 .PHONY: deps
 deps: go.mod go.sum
@@ -40,26 +42,42 @@ $(CRD_DIR)/opentelemetry.io_instrumentations.yaml:
 
 $(CRD_DIR)/monitoring.coreos.com_prometheusagents.yaml:
 	@mkdir -p $(CRD_DIR)
-	@curl https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/refs/heads/release-0.77/example/prometheus-operator-crd-full/monitoring.coreos.com_prometheusagents.yaml  > $(CRD_DIR)/monitoring.coreos.com_prometheusagents.yaml
+	@curl https://raw.githubusercontent.com/rhobs/obo-prometheus-operator/refs/tags/v0.83.0-rhobs1/example/prometheus-operator-crd/monitoring.rhobs_prometheusagents.yaml  > $(CRD_DIR)/monitoring.coreos.com_prometheusagents.yaml
 
 $(CRD_DIR)/monitoring.coreos.com_scrapeconfigs.yaml:
 	@mkdir -p $(CRD_DIR)
-	@curl https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/refs/heads/release-0.77/example/prometheus-operator-crd-full/monitoring.coreos.com_scrapeconfigs.yaml  > $(CRD_DIR)/monitoring.coreos.com_scrapeconfigs.yaml
+	@curl https://raw.githubusercontent.com/rhobs/obo-prometheus-operator/refs/tags/v0.83.0-rhobs1/example/prometheus-operator-crd/monitoring.rhobs_scrapeconfigs.yaml  > $(CRD_DIR)/monitoring.coreos.com_scrapeconfigs.yaml
 
-.PHONY: install-crds
-install-crds: $(CRD_DIR)/observability.openshift.io_clusterlogforwarders.yaml $(CRD_DIR)/opentelemetry.io_opentelemetrycollectors.yaml $(CRD_DIR)/opentelemetry.io_instrumentations.yaml $(CRD_DIR)/monitoring.coreos.com_prometheusagents.yaml $(CRD_DIR)/monitoring.coreos.com_scrapeconfigs.yaml
+$(CRD_DIR)/monitoring.rhobs_prometheusrules.yaml:
+	@mkdir -p $(CRD_DIR)
+	@curl https://raw.githubusercontent.com/rhobs/obo-prometheus-operator/refs/tags/v0.83.0-rhobs1/example/prometheus-operator-crd/monitoring.rhobs_prometheusrules.yaml  > $(CRD_DIR)/monitoring.rhobs_prometheusrules.yaml
 
-.PHONY: fmt
-fmt: $(GOFUMPT) ## Run gofumpt on source code.
-	find . -type f -name '*.go' -not -path '**/fake_*.go' -exec $(GOFUMPT) -w {} \;
+$(CRD_DIR)/core.observatorium.io_observatoria.yaml:
+	@mkdir -p $(CRD_DIR)
+	@curl https://raw.githubusercontent.com/stolostron/observatorium-operator/blob/main/manifests/crds/core.observatorium.io_observatoria.yaml  > $(CRD_DIR)/core.observatorium.io_observatoria.yaml
+
+.PHONY: update-metrics-crds
+update-metrics-crds: ## Update the metrics CRDs from the rhobs/obo-prometheus-operator repository.
+	@./hack/update-metrics-crds.sh
+
+.PHONY: download-crds
+download-crds: $(CRD_DIR)/observability.openshift.io_clusterlogforwarders.yaml $(CRD_DIR)/opentelemetry.io_opentelemetrycollectors.yaml $(CRD_DIR)/opentelemetry.io_instrumentations.yaml $(CRD_DIR)/monitoring.coreos.com_prometheusagents.yaml $(CRD_DIR)/monitoring.coreos.com_scrapeconfigs.yaml $(CRD_DIR)/monitoring.rhobs_prometheusrules.yaml $(CRD_DIR)/core.observatorium.io_observatoria.yaml
+
+.PHONY: verify-dockerfile-labels
+verify-dockerfile-labels: ## Verify Dockerfile.Konflux RHEL version consistency
+	@./hack/verify-dockerfile-labels.sh
 
 .PHONY: lint
-lint: $(GOLANGCI_LINT) ## Run golangci-lint on source code.
+lint: $(GOLANGCI_LINT) verify-dockerfile-labels ## Run golangci-lint and dockerfile verification
+	$(GOLANGCI_LINT) config verify
 	$(GOLANGCI_LINT) run --timeout=5m ./...
 
 .PHONY: lint-fix
 lint-fix: $(GOLANGCI_LINT) ## Attempt to automatically fix lint issues in source code.
 	$(GOLANGCI_LINT) run --fix --timeout=5m ./...
+
+.PHONY: fmt
+fmt: lint-fix
 
 .PHONY: test
 test:
@@ -75,20 +93,24 @@ addon: deps fmt ## Build addon binary
 
 .PHONY: oci-build
 oci-build: ## Build the image
-	podman build -t ${IMG} .
+	$(CONTAINER_ENGINE) build --platform $(PLATFORM) -t ${IMG} .
 
 .PHONY: oci-push
 oci-push: ## Push the image
-	podman push ${IMG}
+	$(CONTAINER_ENGINE) push ${IMG}
 
 .PHONY: oci
 oci: oci-build oci-push
 
+.PHONY: install-crds
+install-crds: download-crds
+	kubectl apply --server-side -f $(CRD_DIR)
+
 .PHONY: addon-deploy
-addon-deploy: $(KUSTOMIZE) install-crds
+addon-deploy: download-crds
 	cd deploy && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build ./deploy | kubectl apply -f -
+	$(KUSTOMIZE) build ./deploy | kubectl apply --server-side -f -
 
 .PHONY: addon-undeploy
-addon-undeploy: $(KUSTOMIZE) install-crds
+addon-undeploy: download-crds
 	$(KUSTOMIZE) build ./deploy | kubectl delete -f -

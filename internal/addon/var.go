@@ -4,37 +4,17 @@ import (
 	"embed"
 )
 
-const (
-	Name              = "multicluster-observability-addon"
-	LabelOCMAddonName = "open-cluster-management.io/addon-name"
-	InstallNamespace  = "open-cluster-management-observability"
-
-	McoaChartDir    = "manifests/charts/mcoa"
-	MetricsChartDir = "manifests/charts/mcoa/charts/metrics"
-	LoggingChartDir = "manifests/charts/mcoa/charts/logging"
-	TracingChartDir = "manifests/charts/mcoa/charts/tracing"
-
-	AddonDeploymentConfigResource = "addondeploymentconfigs"
-	ClusterLogForwardersResource  = "clusterlogforwarders"
-	SpokeCLFName                  = "mcoa-instance"
-	SpokeCLFNamespace             = "openshift-logging"
-	clfProbeKey                   = "isReady"
-	// TODO @JoaoBraveCoding this most likely needs to be updated to reflect the new path
-	clfProbePath = ".status.conditions[?(@.type==\"Ready\")].status"
-
-	OpenTelemetryCollectorsResource = "opentelemetrycollectors"
-	InstrumentationResource         = "instrumentations"
-	SpokeOTELColName                = "mcoa-instance"
-	SpokeInstrumentationName        = "mcoa-instance"
-	SpokeOTELColNamespace           = "mcoa-opentelemetry"
-	otelColProbeKey                 = "replicas"
-	otelColProbePath                = ".spec.replicas"
-)
-
 //go:embed manifests
 //go:embed manifests/charts/mcoa
 //go:embed manifests/charts/mcoa/templates/_helpers.tpl
 //go:embed manifests/charts/mcoa/charts/logging/templates/_helpers.tpl
 //go:embed manifests/charts/mcoa/charts/metrics/templates/_helpers.tpl
 //go:embed manifests/charts/mcoa/charts/tracing/templates/_helpers.tpl
+//go:embed manifests/charts/mcoa/charts/coo/templates/_helpers.tpl
+//go:embed manifests/charts/mcoa/charts/metrics/templates/non-ocp/monitoring/kube-state-metrics/_helpers.tpl
+//go:embed manifests/charts/mcoa/charts/metrics/templates/non-ocp/monitoring/node-exporter/_helpers.tpl
+//go:embed manifests/charts/mcoa/charts/metrics/templates/non-ocp/monitoring/prometheus/rules/_helpers.tpl
+//go:embed manifests/charts/mcoa/charts/metrics/templates/non-ocp/monitoring/prometheus/server/_helpers.tpl
+//go:embed manifests/charts/mcoa/charts/obs-api/templates/_helpers.tpl
+
 var FS embed.FS

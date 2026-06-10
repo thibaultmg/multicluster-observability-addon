@@ -4,9 +4,12 @@ import (
 	"testing"
 
 	prometheusv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	prometheusalpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
-	"github.com/rhobs/multicluster-observability-addon/internal/metrics/handlers"
-	"github.com/rhobs/multicluster-observability-addon/internal/metrics/manifests"
+	cooprometheusv1 "github.com/rhobs/obo-prometheus-operator/pkg/apis/monitoring/v1"
+	cooprometheusv1alpha1 "github.com/rhobs/obo-prometheus-operator/pkg/apis/monitoring/v1alpha1"
+	"github.com/stolostron/multicluster-observability-addon/internal/addon"
+	"github.com/stolostron/multicluster-observability-addon/internal/metrics/config"
+	"github.com/stolostron/multicluster-observability-addon/internal/metrics/handlers"
+	"github.com/stolostron/multicluster-observability-addon/internal/metrics/manifests"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,21 +19,21 @@ func TestBuildValues(t *testing.T) {
 	testCases := map[string]struct {
 		Options     handlers.Options
 		ExpectError bool
-		Expect      func(t *testing.T, values manifests.MetricsValues)
+		Expect      func(t *testing.T, values *manifests.MetricsValues)
 	}{
 		"with platform resources": {
 			Options: handlers.Options{
 				Platform: handlers.Collector{
-					PrometheusAgent: &prometheusalpha1.PrometheusAgent{
-						Spec: prometheusalpha1.PrometheusAgentSpec{
-							CommonPrometheusFields: prometheusv1.CommonPrometheusFields{
+					PrometheusAgent: &cooprometheusv1alpha1.PrometheusAgent{
+						Spec: cooprometheusv1alpha1.PrometheusAgentSpec{
+							CommonPrometheusFields: cooprometheusv1.CommonPrometheusFields{
 								LogLevel: "info",
 							},
 						},
 					},
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.True(t, values.PlatformEnabled)
 				assert.False(t, values.UserWorkloadsEnabled)
 				assert.NotEmpty(t, values.Platform.PrometheusAgentSpec)
@@ -39,18 +42,18 @@ func TestBuildValues(t *testing.T) {
 		"with user workloads resources": {
 			Options: handlers.Options{
 				UserWorkloads: handlers.Collector{
-					PrometheusAgent: &prometheusalpha1.PrometheusAgent{
-						Spec: prometheusalpha1.PrometheusAgentSpec{
-							CommonPrometheusFields: prometheusv1.CommonPrometheusFields{
+					PrometheusAgent: &cooprometheusv1alpha1.PrometheusAgent{
+						Spec: cooprometheusv1alpha1.PrometheusAgentSpec{
+							CommonPrometheusFields: cooprometheusv1.CommonPrometheusFields{
 								LogLevel: "info",
 							},
 						},
 					},
-					ScrapeConfigs: []*prometheusalpha1.ScrapeConfig{},
+					ScrapeConfigs: []*cooprometheusv1alpha1.ScrapeConfig{},
 					Rules:         []*prometheusv1.PrometheusRule{},
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.False(t, values.PlatformEnabled)
 				assert.True(t, values.UserWorkloadsEnabled)
 				assert.NotEmpty(t, values.UserWorkload.PrometheusAgentSpec)
@@ -58,13 +61,13 @@ func TestBuildValues(t *testing.T) {
 		},
 		"image overrides": {
 			Options: handlers.Options{
-				Images: handlers.ImagesOptions{
-					PrometheusOperator:       "prometheus-operator:latest",
-					PrometheusConfigReloader: "prometheus-config-reloader:latest",
+				Images: config.ImageOverrides{
+					CooPrometheusOperatorImage: "obo-prometheus-operator:latest",
+					PrometheusConfigReloader:   "prometheus-config-reloader:latest",
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
-				assert.Equal(t, "prometheus-operator:latest", values.Images.PrometheusOperator)
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Equal(t, "obo-prometheus-operator:latest", values.Images.CooPrometheusOperator)
 				assert.Equal(t, "prometheus-config-reloader:latest", values.Images.PrometheusConfigReloader)
 			},
 		},
@@ -75,70 +78,53 @@ func TestBuildValues(t *testing.T) {
 					newSecret("b"),
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.Len(t, values.Secrets, 2)
 				assert.Equal(t, "a", values.Secrets[0].Name)
 				assert.Equal(t, "b", values.Secrets[1].Name)
 			},
 		},
-		"with platform configmaps": {
+		"with configmaps": {
 			Options: handlers.Options{
-				Platform: handlers.Collector{
-					ConfigMaps: []*corev1.ConfigMap{
-						newConfigmap("a"),
-						newConfigmap("b"),
-					},
+				ConfigMaps: []*corev1.ConfigMap{
+					newConfigmap("a"),
+					newConfigmap("b"),
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
-				assert.Len(t, values.Platform.ConfigMaps, 2)
-				assert.Equal(t, "a", values.Platform.ConfigMaps[0].Name)
-				assert.Equal(t, "b", values.Platform.ConfigMaps[1].Name)
-			},
-		},
-		"with user workload configmaps": {
-			Options: handlers.Options{
-				UserWorkloads: handlers.Collector{
-					ConfigMaps: []*corev1.ConfigMap{
-						newConfigmap("a"),
-						newConfigmap("b"),
-					},
-				},
-			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
-				assert.Len(t, values.UserWorkload.ConfigMaps, 2)
-				assert.Equal(t, "a", values.UserWorkload.ConfigMaps[0].Name)
-				assert.Equal(t, "b", values.UserWorkload.ConfigMaps[1].Name)
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Len(t, values.ConfigMaps, 2)
+				assert.Equal(t, "a", values.ConfigMaps[0].Name)
+				assert.Equal(t, "b", values.ConfigMaps[1].Name)
 			},
 		},
 		"with platform scrape configs": {
 			Options: handlers.Options{
 				Platform: handlers.Collector{
-					ScrapeConfigs: []*prometheusalpha1.ScrapeConfig{
+					ScrapeConfigs: []*cooprometheusv1alpha1.ScrapeConfig{
 						newScrapeConfig("a"),
 						newScrapeConfig("b"),
 					},
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.Len(t, values.Platform.ScrapeConfigs, 2)
-				assert.Equal(t, values.Platform.ScrapeConfigs[0].Name, "a")
-				assert.Equal(t, values.Platform.ScrapeConfigs[1].Name, "b")
+				assert.Equal(t, "a", values.Platform.ScrapeConfigs[0].Name)
+				assert.Equal(t, "b", values.Platform.ScrapeConfigs[1].Name)
 			},
 		},
 		"with user workload scrape configs": {
 			Options: handlers.Options{
 				UserWorkloads: handlers.Collector{
-					ScrapeConfigs: []*prometheusalpha1.ScrapeConfig{
+					ScrapeConfigs: []*cooprometheusv1alpha1.ScrapeConfig{
 						newScrapeConfig("a"),
 						newScrapeConfig("b"),
 					},
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.Len(t, values.UserWorkload.ScrapeConfigs, 2)
-				assert.Equal(t, values.UserWorkload.ScrapeConfigs[0].Name, "a")
-				assert.Equal(t, values.UserWorkload.ScrapeConfigs[1].Name, "b")
+				assert.Equal(t, "a", values.UserWorkload.ScrapeConfigs[0].Name)
+				assert.Equal(t, "b", values.UserWorkload.ScrapeConfigs[1].Name)
 			},
 		},
 		"with platform rules": {
@@ -147,10 +133,10 @@ func TestBuildValues(t *testing.T) {
 					Rules: []*prometheusv1.PrometheusRule{newRule("a"), newRule("b")},
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.Len(t, values.Platform.Rules, 2)
-				assert.Equal(t, values.Platform.Rules[0].Name, "a")
-				assert.Equal(t, values.Platform.Rules[1].Name, "b")
+				assert.Equal(t, "a", values.Platform.Rules[0].Name)
+				assert.Equal(t, "b", values.Platform.Rules[1].Name)
 			},
 		},
 		"with user workload rules": {
@@ -159,10 +145,104 @@ func TestBuildValues(t *testing.T) {
 					Rules: []*prometheusv1.PrometheusRule{newRule("a"), newRule("b")},
 				},
 			},
-			Expect: func(t *testing.T, values manifests.MetricsValues) {
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
 				assert.Len(t, values.UserWorkload.Rules, 2)
-				assert.Equal(t, values.UserWorkload.Rules[0].Name, "a")
-				assert.Equal(t, values.UserWorkload.Rules[1].Name, "b")
+				assert.Equal(t, "a", values.UserWorkload.Rules[0].Name)
+				assert.Equal(t, "b", values.UserWorkload.Rules[1].Name)
+			},
+		},
+		"with user workload COO rules": {
+			Options: handlers.Options{
+				UserWorkloads: handlers.Collector{
+					COORules: []*cooprometheusv1.PrometheusRule{newCOORule("coo-a"), newCOORule("coo-b")},
+				},
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Len(t, values.UserWorkload.Rules, 2)
+				assert.Equal(t, "coo-a", values.UserWorkload.Rules[0].Name)
+				assert.Equal(t, "coo-b", values.UserWorkload.Rules[1].Name)
+				assert.Equal(t, "monitoring.rhobs/v1", values.UserWorkload.Rules[0].APIVersion)
+				assert.Equal(t, "monitoring.rhobs/v1", values.UserWorkload.Rules[1].APIVersion)
+			},
+		},
+		"with mixed user workload rules and COO rules": {
+			Options: handlers.Options{
+				UserWorkloads: handlers.Collector{
+					Rules:    []*prometheusv1.PrometheusRule{newRule("coreos-a")},
+					COORules: []*cooprometheusv1.PrometheusRule{newCOORule("rhobs-a")},
+				},
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Len(t, values.UserWorkload.Rules, 2)
+				assert.Equal(t, "coreos-a", values.UserWorkload.Rules[0].Name)
+				assert.Empty(t, values.UserWorkload.Rules[0].APIVersion)
+				assert.Equal(t, "rhobs-a", values.UserWorkload.Rules[1].Name)
+				assert.Equal(t, "monitoring.rhobs/v1", values.UserWorkload.Rules[1].APIVersion)
+			},
+		},
+		"with user workload service monitors": {
+			Options: handlers.Options{
+				UserWorkloads: handlers.Collector{
+					ServiceMonitors: []*prometheusv1.ServiceMonitor{newServiceMonitor("a"), newServiceMonitor("b")},
+				},
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Len(t, values.UserWorkload.ServiceMonitors, 2)
+				assert.Equal(t, "a", values.UserWorkload.ServiceMonitors[0].Name)
+				assert.Equal(t, "b", values.UserWorkload.ServiceMonitors[1].Name)
+			},
+		},
+		"with deploy non ocp stack": {
+			Options: handlers.Options{
+				Platform: handlers.Collector{
+					PrometheusAgent: &cooprometheusv1alpha1.PrometheusAgent{},
+				},
+				IsOpenShiftVendor: false,
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.True(t, values.DeployNonOCPStack)
+			},
+		},
+		"with deploy coo resources": {
+			Options: handlers.Options{
+				Platform: handlers.Collector{
+					PrometheusAgent: &cooprometheusv1alpha1.PrometheusAgent{},
+				},
+				IsHub:           false,
+				COOIsSubscribed: false,
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.True(t, values.DeployCOOResources)
+			},
+		},
+		"with prometheus operator annotation": {
+			Options: handlers.Options{
+				CRDEstablishedAnnotation: "true",
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Equal(t, "true", values.PrometheusOperatorAnnotations)
+			},
+		},
+		"with hub cluster id": {
+			Options: handlers.Options{
+				HubClusterID: "12345-67890-abcdef",
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				trimmedID := config.GetTrimmedClusterID("12345-67890-abcdef")
+				assert.Equal(t, config.GetAlertmanagerRouterCASecretName(trimmedID), values.AlertmanagerRouterCASecretName)
+				assert.Equal(t, config.GetAlertmanagerAccessorSecretName(trimmedID), values.AlertmanagerAccessorSecretName)
+			},
+		},
+		"with node exporter options": {
+			Options: handlers.Options{
+				NodeExporter: addon.NodeExporterOptions{
+					HostPort:     19100,
+					InternalPort: 19101,
+				},
+			},
+			Expect: func(t *testing.T, values *manifests.MetricsValues) {
+				assert.Equal(t, int32(19100), values.NodeExporter.HostPort)
+				assert.Equal(t, int32(19101), values.NodeExporter.InternalPort)
 			},
 		},
 	}
@@ -201,8 +281,8 @@ func newConfigmap(name string) *corev1.ConfigMap {
 	}
 }
 
-func newScrapeConfig(name string) *prometheusalpha1.ScrapeConfig {
-	return &prometheusalpha1.ScrapeConfig{
+func newScrapeConfig(name string) *cooprometheusv1alpha1.ScrapeConfig {
+	return &cooprometheusv1alpha1.ScrapeConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
@@ -211,6 +291,22 @@ func newScrapeConfig(name string) *prometheusalpha1.ScrapeConfig {
 
 func newRule(name string) *prometheusv1.PrometheusRule {
 	return &prometheusv1.PrometheusRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+	}
+}
+
+func newCOORule(name string) *cooprometheusv1.PrometheusRule {
+	return &cooprometheusv1.PrometheusRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+	}
+}
+
+func newServiceMonitor(name string) *prometheusv1.ServiceMonitor {
+	return &prometheusv1.ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},

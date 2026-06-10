@@ -1,0 +1,150 @@
+{{- if  .Values.deployCOOResources }}
+{{- $appName := .Values.prometheusOperator.appName }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: {{ .Values.prometheusOperator.component }}
+    app.kubernetes.io/name: {{ .Values.prometheusOperator.appName }}
+    {{ include "metricshelm.labels" . | nindent 4 }}
+  name: {{ .Values.prometheusOperator.appName }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: {{ .Values.prometheusOperator.component }}
+      app.kubernetes.io/name: {{ .Values.prometheusOperator.appName }}
+      app.kubernetes.io/part-of: multicluster-observability-addon
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: prometheus-operator
+        {{- if .Values.prometheusOperatorAnnotations }}
+        observability.openshift.io/crd-established-timestamps: {{ .Values.prometheusOperatorAnnotations | quote }}
+        {{- end }}
+      labels:
+        app.kubernetes.io/component: {{ .Values.prometheusOperator.component }}
+        app.kubernetes.io/name: {{ .Values.prometheusOperator.appName }}
+        app.kubernetes.io/part-of: multicluster-observability-addon
+    spec:
+      containers:
+      - image: {{ .Values.images.cooPrometheusOperator }}
+        args:
+          - '--prometheus-config-reloader={{ .Values.images.prometheusConfigReloader }}'
+          - '--prometheus-instance-namespaces={{ .Release.Namespace }}'
+          - '--thanos-ruler-instance-namespaces={{ .Release.Namespace }}'
+          - '--alertmanager-instance-namespaces={{ .Release.Namespace }}'
+          - '--kubelet-service=kube-system/kubelet'
+          - '--kubelet-endpointslice=true'
+          - '--kubelet-endpoints=false'
+          - '--config-reloader-cpu-limit=0'
+          - '--config-reloader-memory-limit=0'
+          - '--config-reloader-cpu-request=1m'
+          - '--config-reloader-memory-request=10Mi'
+          - '--controller-id={{ .Values.prometheusControllerID }}'
+        imagePullPolicy: IfNotPresent
+        name: prometheus-operator
+        ports:
+        {{- if .Values.deployNonOCPStack }}
+          - name: metrics
+            containerPort: 8080
+            protocol: TCP
+        {{- end }}
+        securityContext: 
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          privileged: false
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        resources:
+        {{- $matched := false }}
+        {{- if .Values.global.resourceRequirements }}
+        {{- $reverseResourceRequirements := reverse .Values.global.resourceRequirements -}}
+        {{- range $requirement := $reverseResourceRequirements -}}
+          {{- if regexMatch $requirement.containerIDRegex (printf "deployments:%s:%s" $appName "prometheus-operator") }}
+            {{- $matched = true }}
+            {{- toYaml $requirement.resources | nindent 10 }}
+            {{- break -}}
+          {{- end -}}
+        {{- end }}
+        {{- end }}
+        {{- if not $matched }}
+          requests:
+            cpu: 5m
+            memory: 100Mi
+        {{- end }}
+      {{- if not .Values.deployNonOCPStack }}
+      - resources:
+        {{- $matched := false }}
+        {{- if .Values.global.resourceRequirements }}
+        {{- $reverseResourceRequirements := reverse .Values.global.resourceRequirements -}}
+        {{- range $requirement := $reverseResourceRequirements -}}
+          {{- if regexMatch $requirement.containerIDRegex (printf "deployments:%s:%s" $appName "kube-rbac-proxy") }}
+            {{- $matched = true }}
+            {{- toYaml $requirement.resources | nindent 10 }}
+            {{- break -}}
+          {{- end -}}
+        {{- end }}
+        {{- end }}
+        {{- if not $matched }}
+          requests:
+            cpu: 1m
+            memory: 15Mi
+        {{- end }}
+        terminationMessagePath: /dev/termination-log
+        name: kube-rbac-proxy
+        securityContext:
+          capabilities:
+            drop:
+              - ALL
+          privileged: false
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+        ports:
+          - name: metrics
+            containerPort: 9092
+            protocol: TCP
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: kube-rbac-proxy-tls
+            readOnly: true
+            mountPath: /etc/tls/private
+        terminationMessagePolicy: File
+        image: {{ .Values.images.rbacProxyImage }}
+        args:
+          - '--secure-listen-address=0.0.0.0:{{ .Values.prometheusOperator.rbacProxyPort }}'
+          - '--upstream=http://127.0.0.1:8080'
+          - '--tls-cert-file=/etc/tls/private/tls.crt'
+          - '--tls-private-key-file=/etc/tls/private/tls.key'
+          - '--logtostderr=true'
+          - '--allow-paths=/metrics'
+      {{- end }}
+      dnsPolicy: ClusterFirst
+      {{- if .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- else }}
+      nodeSelector:
+        kubernetes.io/os: linux
+      {{- end }}
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      serviceAccount: prometheus-operator
+      serviceAccountName:  {{ .Values.prometheusOperator.appName }}
+      terminationGracePeriodSeconds: 600
+      {{- if not .Values.deployNonOCPStack }}
+      volumes:
+        - name: kube-rbac-proxy-tls
+          secret:
+            secretName: {{ .Values.prometheusOperator.rbacProxyTlsSecret }}
+            defaultMode: 420
+      {{- end }}
+{{- end }}

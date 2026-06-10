@@ -8,9 +8,10 @@ import (
 	otelv1beta1 "github.com/open-telemetry/opentelemetry-operator/apis/v1beta1"
 	operatorsv1 "github.com/operator-framework/api/pkg/operators/v1"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
-	"github.com/rhobs/multicluster-observability-addon/internal/addon"
-	"github.com/rhobs/multicluster-observability-addon/internal/tracing/handlers"
-	"github.com/rhobs/multicluster-observability-addon/internal/tracing/manifests"
+	"github.com/stolostron/multicluster-observability-addon/internal/addon"
+	addoncfg "github.com/stolostron/multicluster-observability-addon/internal/addon/config"
+	"github.com/stolostron/multicluster-observability-addon/internal/tracing/handlers"
+	"github.com/stolostron/multicluster-observability-addon/internal/tracing/manifests"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,8 +19,7 @@ import (
 	"open-cluster-management.io/addon-framework/pkg/addonfactory"
 	"open-cluster-management.io/addon-framework/pkg/addonmanager/addontesting"
 	"open-cluster-management.io/addon-framework/pkg/agent"
-	addonapiv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
-	fakeaddon "open-cluster-management.io/api/client/addon/clientset/versioned/fake"
+	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -35,7 +35,7 @@ var (
 func fakeGetValues(k8s client.Client) addonfactory.GetValuesFunc {
 	return func(
 		cluster *clusterv1.ManagedCluster,
-		mcAddon *addonapiv1alpha1.ManagedClusterAddOn,
+		mcAddon *addonapiv1beta1.ManagedClusterAddOn,
 	) (addonfactory.Values, error) {
 		opts, err := handlers.BuildOptions(context.TODO(), k8s, mcAddon, addon.TracesOptions{InstrumentationEnabled: true})
 		if err != nil {
@@ -55,15 +55,14 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 	var (
 		// Addon envinronment and registration
 		managedCluster      *clusterv1.ManagedCluster
-		managedClusterAddOn *addonapiv1alpha1.ManagedClusterAddOn
+		managedClusterAddOn *addonapiv1beta1.ManagedClusterAddOn
 
 		// Addon configuration
-		addOnDeploymentConfig *addonapiv1alpha1.AddOnDeploymentConfig
+		addOnDeploymentConfig *addonapiv1beta1.AddOnDeploymentConfig
 		authCM                *corev1.ConfigMap
 
 		// Test clients
-		fakeKubeClient  client.Client
-		fakeAddonClient *fakeaddon.Clientset
+		fakeKubeClient client.Client
 	)
 
 	// Setup a managed cluster
@@ -71,30 +70,26 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 
 	// Register the addon for the managed cluster
 	managedClusterAddOn = addontesting.NewAddon("test", "cluster-1")
-	managedClusterAddOn.Spec.Configs = []addonapiv1alpha1.AddOnConfig{
+	managedClusterAddOn.Spec.Configs = []addonapiv1beta1.AddOnConfig{
 		{
-			ConfigGroupResource: addonapiv1alpha1.ConfigGroupResource{
+			ConfigGroupResource: addonapiv1beta1.ConfigGroupResource{
 				Group:    "",
 				Resource: "configmaps",
 			},
-			ConfigReferent: addonapiv1alpha1.ConfigReferent{
+			ConfigReferent: addonapiv1beta1.ConfigReferent{
 				Namespace: "open-cluster-management-observability",
 				Name:      "tracing-auth",
 			},
 		},
 	}
-	managedClusterAddOn.Status.ConfigReferences = []addonapiv1alpha1.ConfigReference{
+	managedClusterAddOn.Status.ConfigReferences = []addonapiv1beta1.ConfigReference{
 		{
-			ConfigGroupResource: addonapiv1alpha1.ConfigGroupResource{
+			ConfigGroupResource: addonapiv1beta1.ConfigGroupResource{
 				Group:    "addon.open-cluster-management.io",
 				Resource: "addondeploymentconfigs",
 			},
-			ConfigReferent: addonapiv1alpha1.ConfigReferent{
-				Namespace: "open-cluster-management-observability",
-				Name:      "multicluster-observability-addon",
-			},
-			DesiredConfig: &addonapiv1alpha1.ConfigSpecHash{
-				ConfigReferent: addonapiv1alpha1.ConfigReferent{
+			DesiredConfig: &addonapiv1beta1.ConfigSpecHash{
+				ConfigReferent: addonapiv1beta1.ConfigReferent{
 					Namespace: "open-cluster-management-observability",
 					Name:      "multicluster-observability-addon",
 				},
@@ -102,23 +97,27 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 			},
 		},
 		{
-			ConfigGroupResource: addonapiv1alpha1.ConfigGroupResource{
+			ConfigGroupResource: addonapiv1beta1.ConfigGroupResource{
 				Group:    "opentelemetry.io",
 				Resource: "opentelemetrycollectors",
 			},
-			ConfigReferent: addonapiv1alpha1.ConfigReferent{
-				Namespace: "open-cluster-management-observability",
-				Name:      "mcoa-instance",
+			DesiredConfig: &addonapiv1beta1.ConfigSpecHash{
+				ConfigReferent: addonapiv1beta1.ConfigReferent{
+					Namespace: "open-cluster-management-observability",
+					Name:      "mcoa-instance",
+				},
 			},
 		},
 		{
-			ConfigGroupResource: addonapiv1alpha1.ConfigGroupResource{
+			ConfigGroupResource: addonapiv1beta1.ConfigGroupResource{
 				Group:    "opentelemetry.io",
 				Resource: "instrumentations",
 			},
-			ConfigReferent: addonapiv1alpha1.ConfigReferent{
-				Namespace: "open-cluster-management-observability",
-				Name:      "mcoa-instance",
+			DesiredConfig: &addonapiv1beta1.ConfigSpecHash{
+				ConfigReferent: addonapiv1beta1.ConfigReferent{
+					Namespace: "open-cluster-management-observability",
+					Name:      "mcoa-instance",
+				},
 			},
 		},
 	}
@@ -132,11 +131,11 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 		Spec: otelv1beta1.OpenTelemetryCollectorSpec{
 			Config: otelv1beta1.Config{
 				Exporters: otelv1beta1.AnyConfig{
-					Object: map[string]interface{}{
-						"otlp": map[string]interface{}{
-							"protocols": map[string]interface{}{
-								"otlp":     map[string]interface{}{},
-								"otlphttp": map[string]interface{}{},
+					Object: map[string]any{
+						"otlp": map[string]any{
+							"protocols": map[string]any{
+								"otlp":     map[string]any{},
+								"otlphttp": map[string]any{},
 							},
 						},
 					},
@@ -157,12 +156,12 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 		},
 	}
 
-	addOnDeploymentConfig = &addonapiv1alpha1.AddOnDeploymentConfig{
+	addOnDeploymentConfig = &addonapiv1beta1.AddOnDeploymentConfig{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "multicluster-observability-addon",
 			Namespace: "open-cluster-management-observability",
 		},
-		Spec: addonapiv1alpha1.AddOnDeploymentConfigSpec{},
+		Spec: addonapiv1beta1.AddOnDeploymentConfigSpec{},
 	}
 
 	authCM = &corev1.ConfigMap{
@@ -176,7 +175,7 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 	}
 
 	// This secret will be generated by cert-manager. We need to create it here
-	// to mock the behaviour from cert-manager
+	// to mock the behavior from cert-manager
 	generatedSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "tracing-otlphttp-auth",
@@ -196,14 +195,14 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 		Build()
 
 	// Setup the fake addon client
-	fakeAddonClient = fakeaddon.NewSimpleClientset(addOnDeploymentConfig)
+	getter := mockAODCGetter{addOnDeploymentConfig}
 	addonConfigValuesFn := addonfactory.GetAddOnDeploymentConfigValues(
-		addonfactory.NewAddOnDeploymentConfigGetter(fakeAddonClient),
+		getter,
 		addonfactory.ToAddOnCustomizedVariableValues,
 	)
 
 	// Wire everything together to a fake addon instance
-	tracingAgentAddon, err := addonfactory.NewAgentAddonFactory(addon.Name, addon.FS, addon.TracingChartDir).
+	tracingAgentAddon, err := addonfactory.NewAgentAddonFactory(addoncfg.Name, addon.FS, addoncfg.TracingChartDir).
 		WithGetValuesFuncs(addonConfigValuesFn, fakeGetValues(fakeKubeClient)).
 		WithAgentRegistrationOption(&agent.RegistrationOption{}).
 		WithScheme(scheme.Scheme).
@@ -211,25 +210,33 @@ func Test_Tracing_AllConfigsTogether_AllResources(t *testing.T) {
 	require.NoError(t, err)
 
 	// Render manifests and return them as k8s runtime objects
-	objects, err := tracingAgentAddon.Manifests(managedCluster, managedClusterAddOn)
+	objects, err := tracingAgentAddon.Manifests(t.Context(), managedCluster, managedClusterAddOn)
 	require.NoError(t, err)
-	require.Equal(t, 6, len(objects))
+	require.Len(t, objects, 6)
 
 	for _, obj := range objects {
 		switch obj := obj.(type) {
 		case *otelv1beta1.OpenTelemetryCollector:
 			// Check name and namespace to make sure that if we change the helm
 			// manifests that we don't break the addon probes
-			require.Equal(t, addon.SpokeOTELColName, obj.Name)
-			require.Equal(t, addon.SpokeOTELColNamespace, obj.Namespace)
+			require.Equal(t, addoncfg.SpokeOTELColName, obj.Name)
+			require.Equal(t, addoncfg.SpokeOTELColNamespace, obj.Namespace)
 			require.NotEmpty(t, obj.Spec.Config)
 		case *otelv1alpha1.Instrumentation:
-			require.Equal(t, addon.SpokeInstrumentationName, obj.Name)
-			require.Equal(t, addon.SpokeOTELColNamespace, obj.Namespace)
+			require.Equal(t, addoncfg.SpokeInstrumentationName, obj.Name)
+			require.Equal(t, addoncfg.SpokeOTELColNamespace, obj.Namespace)
 		case *corev1.Secret:
 			if obj.Name == "tracing-otlphttp-auth" {
 				require.Equal(t, generatedSecret.Data, obj.Data)
 			}
 		}
 	}
+}
+
+type mockAODCGetter struct {
+	aodc *addonapiv1beta1.AddOnDeploymentConfig
+}
+
+func (m mockAODCGetter) Get(ctx context.Context, namespace, name string) (*addonapiv1beta1.AddOnDeploymentConfig, error) {
+	return m.aodc, nil
 }

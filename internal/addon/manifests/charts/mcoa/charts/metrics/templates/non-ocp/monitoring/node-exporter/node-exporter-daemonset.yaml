@@ -1,0 +1,138 @@
+{{- if .Values.deployNonOCPStack }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "node-exporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "node-exporter.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "node-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "node-exporter.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+      - args:
+        - --web.listen-address=127.0.0.1:{{ .Values.nodeExporter.internalPort }}
+        - --path.sysfs=/host/sys
+        - --path.rootfs=/host/root
+        - --no-collector.wifi
+        - --no-collector.hwmon
+        - --collector.filesystem.ignored-mount-points=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/pods/.+)($|/)
+        - --collector.netclass.ignored-devices=^(veth.*|[a-z0-9]+@if\d+)$
+        - --collector.netdev.device-exclude=^(veth.*|[a-z0-9]+@if\d+)$
+        image: {{ .Values.images.nodeExporter }}
+        name: node-exporter
+        resources:
+        {{- $matched := false }}
+        {{- if .Values.global.resourceRequirements }}
+        {{- $reverseResourceRequirements := reverse .Values.global.resourceRequirements -}}
+        {{- range $requirement := $reverseResourceRequirements -}}
+          {{- if regexMatch $requirement.containerIDRegex (printf "daemonsets:%s:%s" (include "node-exporter.fullname" .) "node-exporter") }}
+            {{- $matched = true }}
+            {{- toYaml $requirement.resources | nindent 10 }}
+            {{- break -}}
+          {{- end -}}
+        {{- end }}
+        {{- end }}
+        {{- if not $matched }}
+          limits:
+            cpu: 250m
+            memory: 300Mi
+          requests:
+            cpu: 102m
+            memory: 200Mi
+        {{- end }}
+        securityContext:
+          runAsUser: 65534
+          runAsGroup: 65534
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /host/sys
+          mountPropagation: HostToContainer
+          name: sys
+          readOnly: true
+        - mountPath: /host/root
+          mountPropagation: HostToContainer
+          name: root
+          readOnly: true
+      - args:
+        - --logtostderr
+        - --secure-listen-address=$(IP):{{ .Values.nodeExporter.hostPort }}
+        - --tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+        - --upstream=http://127.0.0.1:{{ .Values.nodeExporter.internalPort }}/
+        env:
+        - name: IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        image: {{ .Values.images.rbacProxyImage }}
+        name: kube-rbac-proxy
+        ports:
+        - containerPort: {{ .Values.nodeExporter.hostPort }}
+          name: https
+        resources:
+        {{- $matched := false }}
+        {{- if .Values.global.resourceRequirements }}
+        {{- $reverseResourceRequirements := reverse .Values.global.resourceRequirements -}}
+        {{- range $requirement := $reverseResourceRequirements -}}
+          {{- if regexMatch $requirement.containerIDRegex (printf "daemonsets:%s:%s" (include "node-exporter.fullname" .) "kube-rbac-proxy") }}
+            {{- $matched = true }}
+            {{- toYaml $requirement.resources | nindent 10 }}
+            {{- break -}}
+          {{- end -}}
+        {{- end }}
+        {{- end }}
+        {{- if not $matched }}
+          limits:
+            cpu: 20m
+            memory: 400Mi
+          requests:
+            cpu: 10m
+            memory: 200Mi
+        {{- end }}
+        securityContext:
+          runAsUser: 65534
+          runAsGroup: 65534
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      hostNetwork: true
+      hostPID: true
+      securityContext:
+        privileged: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: {{ include "node-exporter.serviceAccountName" . }}
+      {{- if .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- else }}
+      nodeSelector:
+        kubernetes.io/os: linux
+      {{- end }}
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- else }}
+      tolerations:
+      - operator: Exists
+      {{- end }}
+      volumes:
+      - hostPath:
+          path: /sys
+        name: sys
+      - hostPath:
+          path: /
+        name: root
+{{- end }}
